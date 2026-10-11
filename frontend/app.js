@@ -97,6 +97,20 @@ const STATUS_LABEL = {
 };
 const STEPS = ["PENDING", "ASSIGNED", "ON_THE_WAY", "DELIVERED"];
 const LOW_LPP = 20; // recent litres per person considered critically low
+// Free residual chlorine at the fill (BIS IS 10500 minimum 0.2 mg/L; WHO maximum 5 mg/L).
+const CL = { min: 0.2, high: 1.0, max: 5.0 };
+const chlorineChip = (r) => {
+  const v = r.chlorineMgL;
+  if (v == null) return r.chlorineStatus === "untested" ? `<span class="chip chip-amber">${L("No chlorine test", "क्लोरीन जाँच नहीं")}</span>` : "";
+  const st = r.chlorineStatus || (v < CL.min || v > CL.max ? "unsafe" : v > CL.high ? "high" : "ok");
+  const [cls, en, hi] = { ok: ["chip-green", "safe", "सुरक्षित"], high: ["chip-amber", "safe, strong", "सुरक्षित, तेज़"], unsafe: ["chip-red", "UNSAFE", "असुरक्षित"] }[st];
+  return `<span class="chip ${cls}">${ic(st === "unsafe" ? "alert" : "drop", "w-3 h-3")} ${L(`Chlorine ${v} mg/L · ${en}`, `क्लोरीन ${v} mg/L · ${hi}`)}</span>`;
+};
+const hhmm = (iso) => new Date(iso).toLocaleTimeString(locale(), { hour: "2-digit", minute: "2-digit" });
+// Expected arrival from the day's schedule (counts tankers finishing current trips, refills and repeat trips).
+const etaChip = (s) => (s ? `<span class="chip chip-violet">${ic("clock", "w-3 h-3")} ${L(
+  `Expected ≈ ${hhmm(s.arriveAt)} · ${s.tankerId.toUpperCase()}${s.tankerFreeNow ? "" : " after its current trip"}`,
+  `अनुमानित ≈ ${hhmm(s.arriveAt)} · ${s.tankerId.toUpperCase()}${s.tankerFreeNow ? "" : " मौजूदा ट्रिप के बाद"}`)}</span>` : "");
 const OPEN = ["PENDING", "ASSIGNED", "ON_THE_WAY"];
 const hoursSince = (iso) => (Date.now() - new Date(iso)) / 3600000;
 // "Load 2 of 3": big colonies get several tankers, one request at a time.
@@ -207,7 +221,8 @@ const ACTIONS = {
   colony_reported: ["Colony reported", "कॉलोनी ने दर्ज किया"], dispatcher_closed: ["Closed by dispatcher", "डिस्पैचर ने बंद किया"],
   auto_closed: ["Auto-closed", "अपने आप बंद"], requeued: ["Back in queue", "फिर सूची में"],
   cancelled: ["Cancelled", "रद्द किया"], follow_up: ["Next load queued", "अगला टैंकर सूची में"],
-  filled: ["Filled at hydrant", "हाइड्रेंट पर भरा"], photo: ["Photo added", "फ़ोटो जोड़ी"], resolved: ["Settled by ward officer", "वार्ड अधिकारी ने निपटाया"],
+  filled: ["Filled at hydrant", "हाइड्रेंट पर भरा"], photo: ["Photo added", "फ़ोटो जोड़ी"],
+  retested: ["Chlorine re-tested", "क्लोरीन दोबारा जाँचा"], quality_override: ["Sent despite failed water test", "जाँच में फ़ेल पानी फिर भी भेजा"], resolved: ["Settled by ward officer", "वार्ड अधिकारी ने निपटाया"],
 };
 const ROLE = { dispatcher: ["Dispatcher", "डिस्पैचर"], driver: ["Driver", "ड्राइवर"], colony: ["Colony rep", "कॉलोनी प्रतिनिधि"], officer: ["Ward officer", "वार्ड अधिकारी"], system: ["System", "सिस्टम"] };
 const timeline = (r) => (r.history && r.history.length ? `
@@ -505,6 +520,7 @@ async function loadColony() {
         ${open.requeuedBy ? `<div class="note mt-5" style="border-color:#f5d48a"><span class="text-amber-600">${ic("info")}</span><span>${requeuedNote(open)}</span></div>` : ""}
         <div class="panel mt-5 flex items-center gap-3"><span class="pulse-dot" style="background:var(--amber)"></span>
           <span>${L("The dispatcher will assign a tanker soon.", "जल्द ही टैंकर भेजा जाएगा।")}</span></div>
+        <div id="colony-eta" class="mt-2"></div>
         ${isRep ? `<button id="btn-cancel" class="btn btn-danger w-full mt-3">${ic("x")} ${L("We have enough water now — cancel request", "अब पानी काफ़ी है — अनुरोध रद्द करें")}</button>` : ""}`}
       ${canConfirm ? `
         <div class="mt-5 space-y-3">
@@ -514,6 +530,14 @@ async function loadColony() {
         </div>` : ""}
       ${!isRep && open.tankerId ? `<div class="mt-5">${signInPrompt("Only this colony's representative can confirm the delivery.", "डिलीवरी की पुष्टि सिर्फ़ इस कॉलोनी के प्रतिनिधि कर सकते हैं।")}</div>` : ""}
       ${timeline(open)}`;
+    if ($("colony-eta") && open.status === "PENDING") {
+      api("/schedule").then((sched) => {
+        const mine = sched.find((x) => x.requestId === open.requestId);
+        if (mine && $("colony-eta")) $("colony-eta").innerHTML = `${etaChip(mine)}<div class="text-[11px] muted mt-1">${L(
+          "Estimate from the queue and each tanker's current trip, refill and drive. It updates as tankers move.",
+          "सूची और हर टैंकर की मौजूदा ट्रिप, भराई और रास्ते से अनुमान। टैंकर चलने पर बदलता है।")}</div>`;
+      }).catch(() => {});
+    }
     if ($("btn-cancel")) $("btn-cancel").onclick = (e) => run(e.currentTarget, async () => {
       await post(`/requests/${open.requestId}/cancel`, { reason: "colony has enough water" });
       toast(L("Request cancelled. The tanker can go to someone who needs it more.", "अनुरोध रद्द। टैंकर अब किसी ज़्यादा ज़रूरतमंद को जा सकता है।"));
@@ -536,7 +560,7 @@ async function loadColony() {
         <div class="flex justify-between items-start gap-3">
           <div class="min-w-0">
             <div class="inline-flex items-center gap-2"><span class="text-emerald-700">${ic("drop")}</span>${fmtTime(r.deliveredAt)}</div>
-            <div class="mt-1.5">${verificationTag(r)}</div>${readings(r)}
+            <div class="mt-1.5">${verificationTag(r)}${chlorineChip(r)}</div>${readings(r)}
           </div>
           <b class="text-base whitespace-nowrap">${num(r.litresDelivered || 0, `hist-${r.requestId}`)} ${L("L", "लीटर")}</b>
         </div>${timeline(r)}</li>`).join("")
@@ -712,6 +736,12 @@ document.addEventListener("toggle", (e) => {
   if (d.dataset && d.dataset.why) d.open ? openWhy.add(d.dataset.why) : openWhy.delete(d.dataset.why);
 }, true);
 
+// On-time % and water safety on each fleet card (last 30 days).
+const scoreChips = (c) => (c ? `<div class="mt-2 flex flex-wrap">${c.onTimePct != null
+  ? `<span class="chip ${c.onTimePct >= 80 ? "chip-green" : c.onTimePct >= 50 ? "chip-amber" : "chip-red"}">${ic("clock", "w-3 h-3")} ${L(`On time ${c.onTimePct}%`, `समय पर ${c.onTimePct}%`)}</span>` : ""}
+  ${c.noShows ? `<span class="chip chip-red">${L(`${c.noShows} no-show${c.noShows > 1 ? "s" : ""}`, `${c.noShows} बार नहीं आया`)}</span>` : ""}
+  ${c.quality.safePct != null ? `<span class="chip ${c.quality.unsafe ? "chip-red" : "chip-green"}">${ic("drop", "w-3 h-3")} ${L(`Water safe ${c.quality.safePct}%`, `पानी सुरक्षित ${c.quality.safePct}%`)}</span>` : ""}</div>` : "");
+
 // One click: every free tanker gets a colony, strictly in queue order, nearest tanker first.
 let planPreview = null;
 const etaIn = (minutes) => { const d = new Date(Date.now() + minutes * 60000); return `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`; };
@@ -749,11 +779,15 @@ function renderPlan(show) {
 }
 
 async function loadDispatcher() {
-  const [queue, tankers, active] = await Promise.all([
+  const [queue, tankers, active, sched, st] = await Promise.all([
     api("/queue"),
     api("/tankers"),
     api("/requests?status=ASSIGNED,ON_THE_WAY"),
+    api("/schedule").catch(() => []),
+    api("/stats").catch(() => ({ tankers: [] })),
   ]);
+  const schedBy = Object.fromEntries(sched.map((x) => [x.requestId, x]));
+  const cardBy = Object.fromEntries((st.tankers || []).map((x) => [x.tankerId, x]));
   const available = tankers.filter((t) => t.status === "AVAILABLE");
   const canDispatch = isRole("dispatcher");
   if (!colonies.length) await loadColonies();
@@ -774,6 +808,7 @@ async function loadDispatcher() {
       <div class="text-sm muted">${esc(t.driverName)}</div>
       <div class="cap"><div style="width:${((t.capacityLitres || 0) / maxCap) * 100}%"></div></div>
       <div class="text-xs muted">${L(`${fmtL(t.capacityLitres)} L capacity`, `क्षमता ${fmtL(t.capacityLitres)} लीटर`)}</div>
+      ${scoreChips(cardBy[t.tankerId])}
       ${canDispatch && t.status !== "BUSY" ? `<button class="btn btn-ghost py-1.5 mt-3 w-full text-xs" data-shift="${esc(t.tankerId)}" data-to="${off ? "AVAILABLE" : "OFF_DUTY"}">
         ${off ? L("Put on duty", "ड्यूटी पर लगाएँ") : L("Mark off duty / repair", "ड्यूटी से हटाएँ / मरम्मत")}</button>` : ""}
     </div>`;
@@ -806,7 +841,7 @@ async function loadDispatcher() {
             <span>${ic("users", "w-3.5 h-3.5")} ${r.households} ${L("households", "घर")}</span>
             <span title="${fmtTime(r.createdAt)}">${ic("clock", "w-3.5 h-3.5")} ${L(`waiting ${ago(r.createdAt)}`, `${ago(r.createdAt)} से इंतज़ार`)}</span>
           </div>
-          <div class="mt-1.5">${loadChip(r)}${waitChip(r)}
+          <div class="mt-1.5">${loadChip(r)}${waitChip(r)}${etaChip(schedBy[r.requestId])}
             ${r.pipedPerPerson7d ? `<span>${ic("drop", "w-3.5 h-3.5")} ${L(`incl. ${r.pipedPerPerson7d} L piped`, `${r.pipedPerPerson7d} लीटर पाइप सहित`)}</span>` : ""}
           </div>
           ${r.priorityWeight && r.priorityWeight !== 1 ? `<span class="chip chip-violet mt-2">×${r.priorityWeight} ${esc(r.priorityReason || "")} · ${L(`counted as ${r.needScore} L`, `${r.needScore} लीटर गिना`)}</span>` : ""}
@@ -861,7 +896,7 @@ async function loadDispatcher() {
         <div class="min-w-0">
           <div class="font-bold">${esc(cname(r))}</div>
           <div class="text-sm muted flex items-center gap-2 mt-0.5">${ic("truck", "w-3.5 h-3.5")} ${esc(r.tankerId)} · ${L("ETA", "समय")} <b class="text-slate-800">${esc(r.eta)}</b></div>
-          <div class="mt-2 flex flex-wrap items-center gap-2">${badge(r.status)}
+          <div class="mt-2 flex flex-wrap items-center gap-2">${badge(r.status)}${chlorineChip(r)}
             ${r.autoReleaseAt ? `<span class="text-[11px] muted inline-flex items-center gap-1" title="${L(
               r.status === "ON_THE_WAY" ? "If nobody confirms, it is closed as delivered (unconfirmed) and the tanker is freed" : "If it never leaves, the tanker is freed and the colony goes back to the queue",
               r.status === "ON_THE_WAY" ? "पुष्टि न होने पर डिलीवरी (बिना पुष्टि) मानकर टैंकर खाली होगा" : "टैंकर न निकला तो खाली होगा और कॉलोनी फिर सूची में")}">${ic("clock", "w-3 h-3")} ${left
@@ -870,7 +905,7 @@ async function loadDispatcher() {
         </div>
         <div class="flex flex-wrap gap-2">
           ${r.status === "ASSIGNED" && canDispatch
-            ? `<button data-dispatch="${id}" class="btn btn-violet">${ic("send")} ${L("Mark on the way", "रास्ते में है")}</button>`
+            ? `${r.waterSafe === false ? `<input data-qo="${id}" class="field py-2" style="min-width:14rem" maxlength="300" aria-label="${esc(L("Reason for sending water that failed the chlorine test", "जाँच में फ़ेल पानी भेजने का कारण"))}" placeholder="${esc(L("Failed chlorine test: reason to send anyway (published)", "क्लोरीन जाँच फ़ेल: फिर भी भेजने का कारण (सार्वजनिक)"))}">` : ""}<button data-dispatch="${id}" class="btn btn-violet">${ic("send")} ${L("Mark on the way", "रास्ते में है")}</button>`
             : `<span class="text-xs muted inline-flex items-center gap-2"><span class="pulse-dot" style="background:#a5b4fc"></span>${r.status === "ASSIGNED"
               ? L("Waiting for the driver to leave", "ड्राइवर के निकलने का इंतज़ार") : L("Waiting for driver or colony to report", "ड्राइवर या कॉलोनी की रिपोर्ट का इंतज़ार")}</span>`}
           ${canDispatch ? `<button data-release-toggle="${id}" class="btn btn-ghost py-2" aria-expanded="${openRelease.has(r.requestId)}">${L("Release", "खाली करें")} ${ic("chev", "w-3.5 h-3.5")}</button>` : ""}
@@ -915,7 +950,8 @@ async function loadDispatcher() {
 
   document.querySelectorAll("[data-dispatch]").forEach((btn) => {
     btn.onclick = () => run(btn, async () => {
-      await post(`/requests/${btn.dataset.dispatch}/dispatch`);
+      const qo = document.querySelector(`[data-qo="${btn.dataset.dispatch}"]`);
+      await post(`/requests/${btn.dataset.dispatch}/dispatch`, qo && qo.value.trim() ? { qualityOverride: qo.value.trim() } : {});
       toast(L("Marked on the way", "रास्ते में दर्ज किया"));
       document.body.classList.remove("quiet");
       loadDispatcher();
@@ -1416,8 +1452,11 @@ async function loadDriver() {
       : L("You have no trip assigned. A fill without a trip is flagged for the ward officer.", "आपकी कोई ट्रिप तय नहीं है। बिना ट्रिप भराई वार्ड अधिकारी को दिखाई जाएगी।")}</p>
     <div class="flex flex-wrap gap-2 mt-3">
       <input id="fill-litres" aria-label="${esc(L("Litres filled", "कितना भरा (लीटर)"))}" type="number" inputmode="numeric" min="1" max="${cap}" value="${cap}" class="field py-2.5" style="width:9rem">
+      <input id="fill-chlorine" aria-label="${esc(L("Chlorine test reading in mg/L", "क्लोरीन जाँच (mg/L)"))}" type="number" inputmode="decimal" min="0" max="20" step="0.1" placeholder="${esc(L("Chlorine mg/L", "क्लोरीन mg/L"))}" class="field py-2.5" style="width:10rem">
       <button id="btn-fill" class="btn btn-primary py-2.5">${ic("drop")} ${L("Log fill", "भराई दर्ज करें")}</button>
-    </div></div>` : "";
+    </div>
+    <p class="text-[11px] muted mt-2">${L(`Test free chlorine with your kit after filling. Safe: ${CL.min}–${CL.max} mg/L (best ${CL.min}–${CL.high}). Below ${CL.min} the trip cannot start until you re-chlorinate and re-test.`,
+      `भरने के बाद किट से क्लोरीन जाँचें। सुरक्षित: ${CL.min}–${CL.max} mg/L (सबसे अच्छा ${CL.min}–${CL.high})। ${CL.min} से कम हो तो दोबारा क्लोरीन डालकर जाँचें, तभी ट्रिप शुरू होगी।`)}</p></div>` : "";
 
   let trip;
   if (current) {
@@ -1435,7 +1474,15 @@ async function loadDriver() {
         ${map ? `<a class="text-sky-700 font-semibold inline-flex items-center gap-1" href="${map}" target="_blank" rel="noopener">${ic("pin", "w-3.5 h-3.5")} ${L("Directions", "रास्ता देखें")}</a>` : ""}
       </div>
       ${current.note ? `<div class="note mt-4">${ic("chat")}<span>“${esc(current.note)}”</span></div>` : ""}
-      ${current.status === "ASSIGNED" ? `<button id="btn-start" class="btn btn-violet btn-lg w-full mt-5">${ic("play", "w-5 h-5")} ${L("Start trip", "ट्रिप शुरू करें")}</button>` : ""}
+      ${current.chlorineMgL != null || current.chlorineStatus ? `<div class="mt-3">${chlorineChip(current)}</div>` : ""}
+      ${current.waterSafe === false && current.status === "ASSIGNED" ? `<div class="panel mt-4" style="border-color:#f3c4cd;background:var(--red-soft)">
+        <b style="color:var(--red)">${ic("alert", "w-4 h-4 inline")} ${L(`Water failed the chlorine test (${current.chlorineMgL} mg/L)`, `पानी क्लोरीन जाँच में फ़ेल (${current.chlorineMgL} mg/L)`)}</b>
+        <p class="text-sm mt-1">${L("Do not deliver. Add chlorine (or refill), wait 30 minutes, then test again.", "पानी न दें। क्लोरीन डालें (या दोबारा भरें), 30 मिनट रुकें, फिर जाँचें।")}</p>
+        <div class="flex flex-wrap gap-2 mt-3">
+          <input id="retest-chlorine" type="number" inputmode="decimal" min="0" max="20" step="0.1" class="field py-2.5" style="width:10rem" aria-label="${esc(L("New chlorine reading in mg/L", "नई क्लोरीन जाँच (mg/L)"))}" placeholder="mg/L">
+          <button id="btn-retest" class="btn btn-primary py-2.5">${ic("drop")} ${L("Save new test", "नई जाँच दर्ज करें")}</button>
+        </div></div>`
+      : current.status === "ASSIGNED" ? `<button id="btn-start" class="btn btn-violet btn-lg w-full mt-5">${ic("play", "w-5 h-5")} ${L("Start trip", "ट्रिप शुरू करें")}</button>` : ""}
       <div class="mt-5">
         <label class="block font-semibold" for="drv-litres">${L("Litres delivered", "कितना पानी दिया (लीटर)")}</label>
         <input id="drv-litres" type="number" inputmode="numeric" min="1" max="${cap}" value="${current.filledLitres || cap}" class="field text-lg mt-2">
@@ -1467,7 +1514,7 @@ async function loadDriver() {
     <ul class="space-y-2 text-sm">${done.length ? done.map((r) => `<li class="panel">
       <div class="flex justify-between gap-3"><span class="font-semibold">${esc(cname(r))}</span><b>${fmtL(r.litresDelivered)} ${L("L", "लीटर")}</b></div>
       <div class="text-xs muted">${fmtTime(r.deliveredAt)}</div>
-      <div class="mt-1.5">${verificationTag(r)}</div>${readings(r)}</li>`).join("")
+      <div class="mt-1.5">${verificationTag(r)}${chlorineChip(r)}</div>${readings(r)}</li>`).join("")
       : `<li class="empty">${L("No trips yet.", "अभी कोई ट्रिप नहीं।")}</li>`}</ul></div>`;
 
   box.innerHTML = head + fillCard + trip + pending + recent;
@@ -1482,14 +1529,23 @@ async function loadDriver() {
   if ($("btn-fill")) $("btn-fill").onclick = (e) => run(e.currentTarget, async () => {
     e.currentTarget.innerHTML = `${ic("pin")} ${L("Getting location…", "लोकेशन ले रहे हैं…")}`;
     const location = await getPosition();
-    const f = await sendOrQueue("/fills", { litres: parseInt($("fill-litres").value, 10), ...(location ? { location } : {}) },
-      L("Hydrant fill", "हाइड्रेंट भराई"));
-    if (f) toast(f.farFromFillPoint
+    const chlorine = $("fill-chlorine").value.trim();
+    const f = await sendOrQueue("/fills", { litres: parseInt($("fill-litres").value, 10), ...(chlorine !== "" ? { chlorineMgL: Number(chlorine) } : {}),
+      ...(location ? { location } : {}) }, L("Hydrant fill", "हाइड्रेंट भराई"));
+    if (f && f.chlorineStatus === "unsafe") toast(L(`Chlorine ${f.chlorineMgL} mg/L is unsafe. Re-chlorinate and re-test before starting the trip.`,
+      `क्लोरीन ${f.chlorineMgL} mg/L असुरक्षित है। ट्रिप से पहले दोबारा क्लोरीन डालकर जाँचें।`), false);
+    else if (f) toast(f.farFromFillPoint
       ? L(`Recorded, but ${f.fillPointDistanceM} m from the nearest hydrant. Flagged for review.`, `दर्ज हुआ, पर नज़दीकी हाइड्रेंट से ${f.fillPointDistanceM} मीटर दूर। जाँच के लिए चिह्नित।`)
       : L(`Fill recorded${f.fillPointName ? ` at ${f.fillPointName}` : ""}`, `भराई दर्ज${f.fillPointName ? ` (${f.fillPointName})` : ""}`), !f.farFromFillPoint);
     loadDriver();
   });
-  if (current && current.status === "ASSIGNED") {
+  if ($("btn-retest")) $("btn-retest").onclick = (e) => run(e.currentTarget, async () => {
+    const f = await post(`/fills/${current.fillId}/retest`, { chlorineMgL: Number($("retest-chlorine").value) });
+    toast(f.chlorineStatus === "unsafe" ? L("Still unsafe. Add chlorine and test again.", "अब भी असुरक्षित। क्लोरीन डालकर फिर जाँचें।")
+      : L("Water is safe now. You can start the trip.", "पानी अब सुरक्षित है। ट्रिप शुरू कर सकते हैं।"), f.chlorineStatus !== "unsafe");
+    loadDriver();
+  });
+  if (current && current.status === "ASSIGNED" && $("btn-start")) {
     $("btn-start").onclick = (e) => run(e.currentTarget, async () => {
       if (await sendOrQueue(`/requests/${current.requestId}/dispatch`, {}, L("Trip start", "ट्रिप शुरू")))
         toast(L("Trip started. Drive safe!", "ट्रिप शुरू। सुरक्षित चलाएँ!"));
@@ -1518,6 +1574,10 @@ const REVIEW_TYPES = {
   complaint_overdue: ["Complaint unanswered for 2 days", "शिकायत 2 दिन से बिना जवाब"],
   over_report: ["Colony reported more than was filled", "कॉलोनी ने भरे से ज़्यादा बताया"],
   no_fill: ["Delivered without a hydrant fill", "बिना हाइड्रेंट भराई के डिलीवरी"],
+  unsafe_water: ["Unsafe chlorine level at the fill", "भराई पर क्लोरीन असुरक्षित"],
+  high_chlorine: ["High chlorine: check dosing", "क्लोरीन ज़्यादा: मात्रा जाँचें"],
+  no_quality_test: ["Fill without a chlorine test", "बिना क्लोरीन जाँच के भराई"],
+  dirty_water_report: ["Dirty water reported by a colony", "कॉलोनी ने गंदे पानी की शिकायत की"],
   gps_far: ["Driver GPS far from colony", "ड्राइवर GPS कॉलोनी से दूर"],
   short_delivery: ["Water missing between hydrant and colony", "हाइड्रेंट और कॉलोनी के बीच पानी गायब"],
   auto_closed: ["Nobody reported the delivery", "किसी ने डिलीवरी दर्ज नहीं की"],
@@ -1639,7 +1699,7 @@ async function loadOfficer() {
       const r = it.requestId ? reqById[it.requestId] : null;
       const key = it.fillId ? `fill-${it.fillId}` : `req-${it.requestId}-${it.type}`;
       const canResolve = r && r.status === "DELIVERED" && !it.fillId;
-      const escalation = it.type === "waiting_too_long" || it.type === "complaint_overdue";
+      const escalation = it.type === "waiting_too_long" || it.type === "complaint_overdue" || it.type === "dirty_water_report";
       return `<li class="q-item reveal" style="--i:${i}">
         <div class="flex justify-between gap-3 flex-wrap">
           <div class="min-w-0">
@@ -1943,6 +2003,21 @@ async function loadLedger() {
       <div class="mt-1">“${esc(o.reason)}”</div>
       <div class="text-xs muted mt-1">${L(`Skipped: ${esc((o.skipped || []).join(", "))}`, `पीछे छोड़े: ${esc((o.skipped || []).join(", "))}`)}</div></li>`).join("")
       : `<li class="empty">${L("No overrides. Every tanker went by the queue.", "कोई नहीं। हर टैंकर सूची के क्रम से गया।")}</li>`}</ul>`;
+
+  $("ledger-scorecards").innerHTML = `
+    <h2 class="card-title"><span class="icon-box">${ic("truck")}</span>${L("Tanker scorecard, last 30 days", "टैंकर रिपोर्ट कार्ड, पिछले 30 दिन")}</h2>
+    <p class="text-sm muted mt-1">${L(`On time = arrived within 15 minutes of the promised time. Water safe = chlorine test at the fill within ${CL.min}–${CL.max} mg/L.`,
+      `समय पर = वादे के 15 मिनट के भीतर पहुँचा। सुरक्षित पानी = भराई पर क्लोरीन ${CL.min}–${CL.max} mg/L।`)}</p>
+    <div class="table-wrap mt-4" tabindex="0"><table class="data">
+      <thead><tr><th>${L("Tanker", "टैंकर")}</th><th>${L("Trips", "ट्रिप")}</th><th>${L("On time", "समय पर")}</th><th>${L("Avg. late", "औसत देरी")}</th><th>${L("No-shows", "नहीं आया")}</th><th>${L("Water safe", "सुरक्षित पानी")}</th><th>${L("Last chlorine", "पिछला क्लोरीन")}</th></tr></thead>
+      <tbody>${(st.tankers || []).map((c) => `<tr>
+        <td class="font-bold whitespace-nowrap">${esc(c.tankerId.toUpperCase())}<div class="text-xs muted font-normal">${esc(c.driverName)}</div></td>
+        <td>${c.trips}</td>
+        <td>${c.onTimePct != null ? `<span class="chip ${c.onTimePct >= 80 ? "chip-green" : c.onTimePct >= 50 ? "chip-amber" : "chip-red"} !m-0">${c.onTimePct}%</span>` : "—"}</td>
+        <td>${c.avgLateMin ? L(`${c.avgLateMin} min`, `${c.avgLateMin} मिनट`) : "—"}</td>
+        <td>${c.noShows ? `<span class="chip chip-red !m-0">${c.noShows}</span>` : "0"}</td>
+        <td>${c.quality.safePct != null ? `<span class="chip ${c.quality.unsafe ? "chip-red" : "chip-green"} !m-0">${c.quality.safePct}% · ${c.quality.tested} ${L("tests", "जाँच")}</span>` : "—"}</td>
+        <td>${c.quality.lastChlorine != null ? `${c.quality.lastChlorine} mg/L` : "—"}</td></tr>`).join("")}</tbody></table></div>`;
 
   $("ledger-complaints").innerHTML = `
     <h2 class="card-title"><span class="icon-box">${ic("chat")}</span>${L("Complaints board", "शिकायत बोर्ड")}</h2>

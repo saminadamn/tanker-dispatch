@@ -208,6 +208,47 @@ class VolumeAndPlanning(unittest.TestCase):
         self.assertEqual(types, ["complaint_overdue", "no_fill", "over_report", "waiting_too_long"])
 
 
+class PunctualityQualitySchedule(unittest.TestCase):
+    def test_promised_time_in_local_time(self):
+        # Assigned 12:00 UTC = 17:30 IST; "18:30" means 13:00 UTC the same day
+        self.assertEqual(insights.promised_at("18:30", iso(NOW)), "2026-10-11T13:00:00Z")
+        # "08:00" when it is already 17:30 locally means tomorrow morning
+        self.assertEqual(insights.promised_at("08:00", iso(NOW)), "2026-10-12T02:30:00Z")
+        self.assertIsNone(insights.promised_at("soon", iso(NOW)))
+
+    def test_on_time_percentage_and_no_shows(self):
+        reqs = [delivered("a", 9000, 1, tankerId="t1", promisedAt=iso(NOW - timedelta(days=1, minutes=10))),  # 10 min late: on time
+                delivered("b", 9000, 2, tankerId="t1", promisedAt=iso(NOW - timedelta(days=2, minutes=60))),  # 60 min late
+                {**pending("c", 3), "missedTankerId": "t1", "requeuedAt": iso(NOW - timedelta(hours=2))}]
+        p = insights.punctuality(reqs, now=NOW)["t1"]
+        self.assertEqual((p["trips"], p["onTime"], p["onTimePct"], p["avgLateMin"], p["noShows"]), (2, 1, 50, 60, 1))
+
+    def test_chlorine_bands(self):
+        self.assertEqual([insights.chlorine_status(v) for v in (None, 0.1, 0.2, 0.8, 1.5, 6)],
+                         ["untested", "unsafe", "ok", "ok", "high", "unsafe"])
+        fills = [{"tankerId": "t1", "at": iso(NOW - timedelta(days=1)), "chlorineMgL": 0.5},
+                 {"tankerId": "t1", "at": iso(NOW - timedelta(hours=5)), "chlorineMgL": 0.1},
+                 {"tankerId": "t1", "at": iso(NOW - timedelta(hours=1))}]
+        q = insights.quality_summary(fills, now=NOW)["t1"]
+        self.assertEqual((q["fills"], q["tested"], q["safe"], q["unsafe"], q["safePct"], q["lastChlorine"]), (3, 2, 1, 1, 50, 0.1))
+
+    def test_schedule_counts_repeat_trips(self):
+        cols = {"c1": {"lat": 28.60, "lon": 77.20}, "c2": {"lat": 28.61, "lon": 77.20}}
+        hyd = [{"id": "h", "name": "Hydrant", "lat": 28.605, "lon": 77.20}]
+        queue = [{"requestId": "r1", "colonyId": "c1"}, {"requestId": "r2", "colonyId": "c2"}]
+        tankers = [{"tankerId": "only", "status": "AVAILABLE", "lastLat": 28.605, "lastLon": 77.20}]
+        plan = insights.schedule(queue, tankers, [], cols, hyd, NOW)
+        self.assertEqual([p["tankerId"] for p in plan], ["only", "only"])   # one tanker does both, one after another
+        self.assertTrue(plan[0]["tankerFreeNow"])
+        self.assertFalse(plan[1]["tankerFreeNow"])
+        second_leg = (ranking.parse_time(plan[1]["arriveAt"]) - ranking.parse_time(plan[0]["arriveAt"])).total_seconds() / 60
+        self.assertGreaterEqual(second_leg, insights.UNLOAD_MIN + insights.FILL_MIN)  # unload, refill, drive
+        busy = [{"tankerId": "b", "status": "BUSY", "lastLat": 28.6, "lastLon": 77.2}]
+        trip = [{"tankerId": "b", "colonyId": "c1", "promisedAt": iso(NOW + timedelta(hours=1))}]
+        first = insights.schedule(queue[:1], busy, trip, cols, hyd, NOW)[0]
+        self.assertGreater(ranking.parse_time(first["arriveAt"]), NOW + timedelta(hours=1, minutes=insights.UNLOAD_MIN))
+
+
 class SignIn(unittest.TestCase):
     def test_pin_hash_roundtrip(self):
         h = auth.hash_pin("482613")

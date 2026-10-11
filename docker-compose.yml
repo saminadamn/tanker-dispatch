@@ -34,6 +34,7 @@ services:
       - ./backend:/app/backend:ro
       - ./local:/app/local:ro
       - ./tests:/app/tests:ro   # docker compose exec api python -m unittest discover -s tests -v
+      - ./frontend:/app/frontend:ro   # for the WebsiteHosting=api test (the function serving the web app)
     ports: ["3001:3001"]
     depends_on: [dynamodb]
 

@@ -307,15 +307,34 @@ def list_fills():
     return scan_all(fills_table)
 
 
-def add_fill(fill, request_id=None, event=None):
+def add_fill(fill, request_id=None, event=None, trip_fields=None):
     """Store a fill. If it belongs to a trip, link it to that request in the same transaction
     (one fill per trip; a second fill for the same trip is refused)."""
-    items = [{"Put": {"TableName": FILLS, "Item": {k: _av(v) for k, v in fill.items()},
+    items = [{"Put": {"TableName": FILLS, "Item": {k: _av(v) for k, v in to_ddb(fill).items()},
                       "ConditionExpression": "attribute_not_exists(fillId)"}}]
     if request_id:
         items.append(_request_update(
-            request_id, {"fillId": fill["fillId"], "filledLitres": fill["litres"]}, event,
+            request_id, {"fillId": fill["fillId"], "filledLitres": fill["litres"], **(trip_fields or {})}, event,
             "attribute_not_exists(fillId) AND #s IN (:a, :o)", {":a": "ASSIGNED", ":o": "ON_THE_WAY"}))
+    _transact(items)
+
+
+def get_fill(fill_id):
+    return get(fills_table, {"fillId": fill_id})
+
+
+def retest_fill(fill_id, fields, request_id=None, trip_fields=None, event=None):
+    """A new chlorine reading after re-chlorinating: update the fill and, if its trip has not left yet, the trip."""
+    items = [{"Update": {
+        "TableName": FILLS, "Key": {"fillId": {"S": fill_id}},
+        "UpdateExpression": "SET " + ", ".join(f"#f{i} = :v{i}" for i in range(len(fields))),
+        "ConditionExpression": "attribute_exists(fillId)",
+        "ExpressionAttributeNames": {f"#f{i}": k for i, k in enumerate(fields)},
+        "ExpressionAttributeValues": {f":v{i}": _av(v) for i, v in enumerate(fields.values())},
+    }}]
+    if request_id:
+        items.append(_request_update(request_id, trip_fields, event, "#s = :a AND fillId = :f",
+                                     {":a": "ASSIGNED", ":f": fill_id}))
     _transact(items)
 
 

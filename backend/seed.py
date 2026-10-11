@@ -66,6 +66,10 @@ PENDING = [
     ("col-01", 2, "Shanti Nagar, garmi bahut hai, peene ka paani khatam"),
 ]
 
+# Index into PAST_DELIVERIES: trips that arrived 70 minutes late, and chlorine readings other than the usual 0.5 mg/L.
+LATE_TRIPS = {1, 7, 8}
+CHLORINE_READINGS = {7: 0.1, 3: 1.4}   # 0.1 is below the BIS minimum (unsafe); 1.4 is safe but strong
+
 COMPLAINTS = [
     ("col-02", "no_show", "Tanker was promised at 4 pm but never came. We waited the whole evening.", 5, None),
     ("col-07", "dirty_water", "Water from yesterday's tanker was brown and smelled bad.", 3,
@@ -138,6 +142,9 @@ def run():
             # Trip distance vs. the average free tanker at the time, for the environmental impact numbers.
             item["tripKm"] = round(1.1 + (i % 4) * 0.6, 2)
             item["altKm"] = round(item["tripKm"] + 1.2 + (i % 3) * 0.8, 2)
+            # Promised arrival: most trips on time, a few late (for the punctuality scorecard).
+            late = i in LATE_TRIPS
+            item["promisedAt"] = iso(delivered - timedelta(minutes=-70 if late else 10))
             if driver_l is not None:
                 item["driverLitres"] = driver_l
             if colony_l is not None:
@@ -145,9 +152,13 @@ def run():
             if filled:
                 fill_id = f"F-seed{i:04d}"
                 item.update({"fillId": fill_id, "filledLitres": filled})
+                chlorine = CHLORINE_READINGS.get(i, 0.5)
+                status = insights.chlorine_status(chlorine)
+                item.update({"chlorineMgL": chlorine, "chlorineStatus": status, "waterSafe": status != "unsafe"})
                 fills.append({"fillId": fill_id, "tankerId": tanker_id, "litres": filled, "requestId": item["requestId"],
                               "at": iso(delivered - timedelta(hours=2)), "by": "demo", "fillPointId": "fp-1",
-                              "fillPointName": "Rajghat hydrant", "fillPointDistanceM": 40, "farFromFillPoint": False})
+                              "fillPointName": "Rajghat hydrant", "fillPointDistanceM": 40, "farFromFillPoint": False,
+                              "chlorineMgL": chlorine, "chlorineStatus": status})
             if colony_id == "col-07" and days == 1:
                 item["override"] = {"reason": "Fire at Kabir Nagar market; fire brigade asked for water support",
                                     "at": iso(delivered - timedelta(hours=3)), "by": "Asha (dispatcher)",
@@ -162,6 +173,8 @@ def run():
             item = {"requestId": str(uuid.uuid4()), "colonyId": colony_id, "status": "PENDING",
                     "createdAt": iso(now - timedelta(hours=hours)), "loadNumber": 1, "loadsTarget": loads,
                     "litresTarget": needed}
+            if colony_id == "col-02":  # tnk-03 was assigned earlier but never came: a no-show on its scorecard
+                item.update({"requeuedAt": iso(now - timedelta(hours=1)), "requeuedBy": "auto", "missedTankerId": "tnk-03"})
             if note:
                 item["note"] = note
                 item["signals"] = assist.find_signals(note)
@@ -173,7 +186,7 @@ def run():
     # A fill with no trip behind it: 10,000 L that never reached any colony.
     fills.append({"fillId": "F-seed-orphan", "tankerId": "tnk-03", "litres": 10000, "at": iso(now - timedelta(days=2)),
                   "by": "demo", "fillPointId": "fp-2", "fillPointName": "ITO filling station",
-                  "fillPointDistanceM": 25, "farFromFillPoint": False})
+                  "fillPointDistanceM": 25, "farFromFillPoint": False, "chlorineMgL": 0.4, "chlorineStatus": "ok"})
     with store.fills_table.batch_writer() as w:
         for f in fills:
             w.put_item(Item=store.to_ddb(f))
@@ -183,6 +196,8 @@ def run():
         c = {"complaintId": f"T-DEMO{i + 1}", "type": kind, "text": text, "colonyId": colony_id,
              "status": "RESOLVED" if resolution else "OPEN", "createdAt": iso(now - timedelta(days=days)),
              "byRole": "colony", "byRef": auth.mask_phone(rep_phone), "byPhone": rep_phone}
+        if kind == "dirty_water":
+            c["tankerId"] = "tnk-02"
         if resolution:
             c.update({"resolvedAt": iso(now - timedelta(days=days - 1)), "resolutionNote": resolution,
                       "resolvedBy": "Meena (ward officer)"})

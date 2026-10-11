@@ -1,7 +1,10 @@
 // Service worker: lets drivers and colony reps open the app with no signal.
 // App files come from the network when online and from the cache when offline; API calls always go to the network,
 // and driver actions made offline are queued by app.js and sent when the phone is back online.
-const CACHE = "tanker-shell-v4";
+const CACHE = "tanker-shell-v5";
+// The app's own files. When the API is served from the same address as the site (WebsiteHosting=api),
+// everything else on this origin is the API and must never come from the cache.
+const APP_FILES = new Set(["", "index.html", "styles.css", "app.js", "config.js", "manifest.webmanifest", "icon.svg", "sw.js"]);
 const SHELL = ["./", "index.html", "styles.css", "app.js", "config.js", "manifest.webmanifest", "icon.svg",
   "https://cdn.tailwindcss.com/3.4.17"];
 
@@ -19,13 +22,14 @@ self.addEventListener("fetch", (e) => {
   const req = e.request;
   if (req.method !== "GET") return;
   const url = new URL(req.url);
-  const isShell = url.origin === location.origin || url.hostname.endsWith("tailwindcss.com") ||
+  const appFile = url.origin === location.origin && APP_FILES.has(url.pathname.split("/").pop());
+  const isShell = appFile || url.hostname.endsWith("tailwindcss.com") ||
     url.hostname.endsWith("googleapis.com") || url.hostname.endsWith("gstatic.com") || url.hostname === "cdnjs.cloudflare.com";
   if (!isShell) return; // API: network only, never stale data
   // App files: network first so a new deploy shows immediately; the cache is the offline fallback.
   // Fonts and the Tailwind script rarely change: cache first.
   e.respondWith(caches.open(CACHE).then(async (cache) => {
-    if (url.origin === location.origin) {
+    if (appFile) {
       try {
         const res = await fetch(req);
         if (res.ok) cache.put(req, res.clone());

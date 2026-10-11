@@ -55,6 +55,9 @@ The queue is sorted by need score, lowest first; on a tie, whoever asked first g
 | Colony vs hydrant | Colony reports more than was filled (10% tolerance) | Flagged |
 | Trip without a fill | Delivered with no fill logged, once hydrants are set up | Flagged |
 | Escalation | A request waiting over 24 h, or a complaint open over 48 h | Flagged to the officer and shown publicly |
+| Water quality | Free chlorine tested by the driver at the fill: below 0.2 mg/L (BIS IS 10500 minimum) or above 5 mg/L (WHO maximum) | The trip cannot start until the driver re-chlorinates and re-tests, or a dispatcher overrides with a published reason |
+| Water quality | Above 1 mg/L (safe but strong), or no test logged | Flagged to the officer |
+| Dirty water | A colony complains of dirty or short water | Linked to the tanker that delivered there in the last 3 days, and counted on its record |
 
 The officer settles an alert with the litres they established (site visit, photo, phone call) and a note; the decision becomes part of the public record. Every action on a request is kept in its history: who did it (name, role, last 4 digits of their phone) and when.
 
@@ -70,6 +73,12 @@ The officer settles an alert with the litres they established (site visit, photo
   - **Assigned but never left** goes back to the queue.
 - **Shifts.** Drivers, dispatchers and the officer can mark a tanker off duty or under repair; it then cannot be assigned.
 - **Plan all free tankers.** One click gives every free tanker a colony, strictly in queue order, each colony getting the nearest free tanker. The dispatcher sees the plan with distances and arrival times (at 18 km/h city speed, plus 10 minutes), can edit the times, then assigns them all.
+- **Tanker scorecard.** For each tanker, over the last 30 days:
+  - **On time:** the promised arrival is recorded when the tanker is assigned (in ward time, India UTC+5:30). A delivery within 15 minutes of it counts as on time.
+  - **Average lateness** and **no-shows** (trips taken back because the tanker never came).
+  - **Water safety:** the share of chlorine tests in the safe range.
+  The scorecard is on the Public Ledger, and the key figures are on each fleet card.
+- **Expected arrival for every waiting colony.** The app simulates the day forward, strictly in queue order. Busy tankers are counted from when they finish their current trip, plus 20 minutes to unload. Every trip includes the drive to the nearest hydrant, 20 minutes to fill, and the drive to the colony (at 18 km/h). Waiting colonies see "Expected ≈ 19:25", and the dispatcher sees the estimate on each queue item (`GET /schedule`).
 - **Ward setup.** On the Ward Officer tab, the officer adds colonies and hydrants by tapping the map, adds tankers and changes their capacity. Hydrants are stored in the database; the `FillPoints` template setting is only used until the first hydrant is added.
 
 ## Smart features (zero cost, no paid AI services)
@@ -142,11 +151,27 @@ docker compose up -d        # DynamoDB Local + the same Lambda code + nginx
 - **Demo data:** loaded on start.
 
 Useful commands:
-- **Run all tests (40):** `docker compose exec api python -m unittest discover -s tests -v`
+- **Run all tests (48):** `docker compose exec api python -m unittest discover -s tests -v`
 - **Reset demo data:** `curl -X POST http://127.0.0.1:3001/local/seed`
 - **Run the auto-release job now:** `curl -X POST "http://127.0.0.1:3001/local/auto-release?hours=0"`
 - **After editing backend code:** `docker compose restart api`
 - **Stop:** `docker compose down`
+
+## Where the website is hosted
+
+`deploy.ps1` supports three options:
+
+| Option | Website | When to use |
+| --- | --- | --- |
+| *(default)* | S3 website behind **Amazon CloudFront** (HTTPS, CDN) | The account is verified for CloudFront |
+| `-ApiSite` | Served by the **same API Gateway + Lambda** as the API, over HTTPS | Everything on AWS while CloudFront isn't available (new accounts must be verified for CloudFront) |
+| `-ExternalSite` | Hosted elsewhere, e.g. GitHub Pages (the workflow in `.github/workflows/pages.yml` publishes `frontend/`) | Backend only on AWS |
+
+With `-ApiSite`, the script bundles `frontend/` into the Lambda package, and the function serves only the listed app files (`index.html`, `app.js`, `styles.css`, `config.js`, `sw.js`, `manifest.webmanifest`, `icon.svg`). Every other path is the API. The site and the API share one HTTPS address, so GPS, camera and microphone work on phones.
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\deploy.ps1 -NoSeed -ApiSite    # switch an existing stack to fully AWS-hosted
+```
 
 ## Deploy (Windows, AWS CLI only)
 
@@ -196,7 +221,7 @@ deploy.ps1            one-command deploy
 ## API
 
 **Public:**
-`GET /colonies`, `/tankers`, `/queue`, `/ledger`, `/stats`, `/forecast?simulateMaxC=`, `/overrides`, `/complaints`, `/fillpoints`, `/heat`, `/export/deliveries.csv`, `GET /requests?colonyId=&tankerId=&status=`, `POST /assist/parse`, `POST /auth/login {phone, pin}`.
+`GET /colonies`, `/tankers`, `/queue`, `/schedule`, `/ledger`, `/stats`, `/forecast?simulateMaxC=`, `/overrides`, `/complaints`, `/fillpoints`, `/heat`, `/export/deliveries.csv`, `GET /requests?colonyId=&tankerId=&status=`, `POST /assist/parse`, `POST /auth/login {phone, pin}`.
 
 **Signed in** (`Authorization: Bearer <token>`), by role:
 
@@ -205,9 +230,10 @@ deploy.ps1            one-command deploy
 | Colony rep or dispatcher | `POST /requests {colonyId, note}` |
 | Dispatcher | `POST /requests/{id}/assign {tankerId, eta, overrideReason?}`, `/release {outcome, litresDelivered?}` |
 | Driver or dispatcher | `POST /requests/{id}/dispatch` |
-| Dispatcher | `GET /dispatch/plan` |
+| Dispatcher | `GET /dispatch/plan`; `POST /requests/{id}/dispatch {qualityOverride}` to send water that failed the chlorine test (reason is published) |
+| Driver | `POST /fills/{id}/retest {chlorineMgL}` |
 | Colony rep or dispatcher | `POST /requests/{id}/cancel {reason}` |
-| Driver | `POST /fills {litres, location?}`, `/requests/{id}/deliver {litresDelivered, location?}`, `/requests/{id}/photo {image}` |
+| Driver | `POST /fills {litres, chlorineMgL?, location?}`, `/requests/{id}/deliver {litresDelivered, location?}`, `/requests/{id}/photo {image}` |
 | Colony rep | `POST /requests/{id}/confirm {litresDelivered}` |
 | Ward officer | `POST /colonies`, `POST /tankers`, `POST /tankers/{id}/settings`, `POST /hydrants`, `POST /hydrants/{id}/delete`, `GET /review`, `GET/POST /users`, `POST /users/{phone}/disable`, `/requests/{id}/resolve {litresDelivered, note}`, `/fills/{id}/review`, `/colonies/{id}/settings`, `/complaints/{id}/resolve` |
 | Driver, dispatcher or officer | `POST /tankers/{id}/status {status}` |

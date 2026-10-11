@@ -40,12 +40,16 @@ Parameters:
   WebsiteHosting:
     Type: String
     Default: cloudfront
-    AllowedValues: [cloudfront, external]
-    Description: cloudfront = S3 website behind CloudFront. external = no website resources here; host frontend/ elsewhere over HTTPS (e.g. GitHub Pages).
+    AllowedValues: [cloudfront, api, external]
+    Description: >-
+      cloudfront = S3 website behind CloudFront (needs a CloudFront-verified account).
+      api = the Lambda function also serves the web app from the same HTTPS API Gateway URL (fully on AWS, no CloudFront).
+      external = no website resources here; host frontend/ elsewhere over HTTPS (e.g. GitHub Pages).
 
 Conditions:
   HasAlertEmail: !Not [!Equals [!Ref AlertEmail, ""]]
   HostsWebsite: !Equals [!Ref WebsiteHosting, cloudfront]
+  ServesSiteFromApi: !Equals [!Ref WebsiteHosting, api]
 
 Globals:
   Function:
@@ -173,6 +177,7 @@ Resources:
           WARD_LON: !Ref WardLongitude
           HEAT_THRESHOLD_C: !Ref HeatThresholdC
           AUTO_RELEASE_HOURS: !Ref AutoReleaseHours
+          SITE_FROM_API: !If [ServesSiteFromApi, "true", "false"]
       Policies:
         - DynamoDBCrudPolicy: { TableName: !Ref ColoniesTable }
         - DynamoDBCrudPolicy: { TableName: !Ref TankersTable }
@@ -193,6 +198,13 @@ Resources:
             ApiId: !Ref HttpApi
             Path: /{proxy+}
             Method: ANY
+        # The site root "/" (only serves the web app when WebsiteHosting=api; otherwise returns 404).
+        Root:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /
+            Method: GET
         # Frees tankers whose delivery was never confirmed. EventBridge schedules are free;
         # ~2,900 Lambda runs a month is far inside the 1M free requests.
         AutoRelease:
@@ -316,6 +328,10 @@ Outputs:
     Condition: HostsWebsite
     Description: HTTPS site (use this one, the microphone needs HTTPS)
     Value: !Sub "https://${WebsiteCdn.DomainName}"
+  ApiWebsiteUrl:
+    Condition: ServesSiteFromApi
+    Description: The web app, served over HTTPS by API Gateway + Lambda
+    Value: !Sub "https://${HttpApi}.execute-api.${AWS::Region}.amazonaws.com/"
   S3WebsiteUrl:
     Condition: HostsWebsite
     Value: !GetAtt WebsiteBucket.WebsiteURL

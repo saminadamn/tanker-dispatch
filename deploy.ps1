@@ -1,12 +1,17 @@
-# Deploys the whole app with only the AWS CLI (SAM CLI not required).
-# Usage:  powershell -ExecutionPolicy Bypass -File .\deploy.ps1 [-Region ap-south-1] [-StackName tanker-dispatch] [-NoSeed] [-AlertEmail you@example.com] [-ExternalSite]
+﻿# Deploys the whole app with only the AWS CLI (SAM CLI not required).
+# Usage:  powershell -ExecutionPolicy Bypass -File .\deploy.ps1 [-Region ap-south-1] [-StackName tanker-dispatch] [-NoSeed] [-AlertEmail you@example.com] [-ApiSite | -ExternalSite]
+#   (default)      website on S3 + CloudFront (the account must be verified for CloudFront)
+#   -ApiSite       everything on AWS without CloudFront: the Lambda function also serves the web app over HTTPS
+#   -ExternalSite  website hosted elsewhere (e.g. GitHub Pages); only the backend is deployed here
 param(
   [string]$Region = "ap-south-1",
   [string]$StackName = "tanker-dispatch",
   [switch]$NoSeed,
   [string]$AlertEmail = "",  # email for error alarms; AWS sends a confirmation link first
-  [switch]$ExternalSite      # skip S3 + CloudFront; frontend/ is hosted elsewhere (GitHub Pages publishes it on git push)
+  [switch]$ExternalSite,     # skip S3 + CloudFront; frontend/ is hosted elsewhere (GitHub Pages publishes it on git push)
+  [switch]$ApiSite           # serve frontend/ from the API itself (API Gateway + Lambda, HTTPS); no CloudFront needed
 )
+if ($ApiSite -and $ExternalSite) { throw "Use either -ApiSite or -ExternalSite, not both" }
 $ErrorActionPreference = "Continue"  # native errors are checked via $LASTEXITCODE
 Set-Location $PSScriptRoot
 
@@ -34,14 +39,28 @@ if ($LASTEXITCODE -ne 0) {
     --region $Region | Out-Null; Check "create auth secret"
 }
 
+$demo = if ($NoSeed) { "false" } else { "true" }  # demo data includes demo sign-in accounts; show them on the sign-in form
+if ($ApiSite) {
+  # Bundle the web app into the Lambda package. Site and API share one HTTPS address, so the app calls its own origin.
+  Write-Host "==> Bundling frontend into the Lambda package (backend/static)" -ForegroundColor Cyan
+  if (Test-Path backend/static) { Remove-Item -Recurse -Force backend/static }
+  New-Item -ItemType Directory backend/static | Out-Null
+  Copy-Item frontend/* backend/static/ -Recurse
+  "window.API_URL = location.origin;`nwindow.DEMO = $demo;" | Out-File -FilePath backend/static/config.js -Encoding ascii
+}
+
 Write-Host "==> Packaging Lambda code" -ForegroundColor Cyan
 aws cloudformation package --template-file template.yaml --s3-bucket $artifacts `
-  --output-template-file packaged.yaml --region $Region; Check "cloudformation package"
+  --output-template-file packaged.yaml --region $Region
+$packaged = $LASTEXITCODE
+if ($ApiSite) { Remove-Item -Recurse -Force backend/static }  # keep the repo clean; the copy is inside the package now
+if ($packaged -ne 0) { throw "cloudformation package failed (exit $packaged)" }
 
-Write-Host "==> Deploying stack $StackName (first deploy takes 5-8 minutes because of CloudFront)" -ForegroundColor Cyan
+Write-Host "==> Deploying stack $StackName (first deploy with CloudFront takes 5-8 minutes)" -ForegroundColor Cyan
 $params = @()
 if ($AlertEmail) { $params += "AlertEmail=$AlertEmail" }
 if ($ExternalSite) { $params += "WebsiteHosting=external" }
+if ($ApiSite) { $params += "WebsiteHosting=api" }
 $overrides = @()
 if ($params) { $overrides = @("--parameter-overrides") + $params }
 aws cloudformation deploy --template-file packaged.yaml --stack-name $StackName `
@@ -53,17 +72,17 @@ function Output($key) {
     --query "Stacks[0].Outputs[?OutputKey=='$key'].OutputValue" --output text
 }
 $apiUrl = Output "ApiUrl"
-if (-not $ExternalSite) {
+if ($ApiSite) { $siteUrl = Output "ApiWebsiteUrl" }
+elseif (-not $ExternalSite) {
   $siteUrl = Output "WebsiteUrl"
   $bucket = Output "WebsiteBucketName"
 }
 $fn = Output "FunctionName"
 
 Write-Host "==> Writing frontend/config.js" -ForegroundColor Cyan
-$demo = if ($NoSeed) { "false" } else { "true" }  # demo data includes demo sign-in accounts; show them on the sign-in form
 "window.API_URL = `"$apiUrl`";`nwindow.DEMO = $demo;" | Out-File -FilePath frontend/config.js -Encoding ascii
 
-if (-not $ExternalSite) {
+if (-not $ExternalSite -and -not $ApiSite) {
   Write-Host "==> Uploading frontend to s3://$bucket" -ForegroundColor Cyan
   aws s3 sync frontend "s3://$bucket" --delete --cache-control "no-cache" --region $Region; Check "s3 sync"
 }
@@ -79,5 +98,7 @@ if (-not $NoSeed) {
 Write-Host ""
 Write-Host "DONE" -ForegroundColor Green
 if ($ExternalSite) { Write-Host "  Website: commit and push frontend/config.js; GitHub Pages publishes frontend/" }
+elseif ($ApiSite) { Write-Host "  Website: $siteUrl   (served by API Gateway + Lambda, HTTPS)" }
 else { Write-Host "  Website: $siteUrl" }
 Write-Host "  API:     $apiUrl"
+

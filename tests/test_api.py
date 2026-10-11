@@ -121,7 +121,7 @@ class Api(unittest.TestCase):
                            {"litresDelivered": 6000, "note": "Driver admits 4,000 L sold on the way; warning issued"}, self.officer)
         self.assertEqual((status, req["verification"]), (200, "resolved"))
         items = call("GET", "/review", token=self.officer)[1]["items"]
-        self.assertFalse(any(i.get("requestId") == rid for i in items))
+        self.assertFalse(any(i.get("requestId") == rid and not i.get("fillId") for i in items))  # fill alerts are reviewed separately
 
     def test_off_duty_tanker_cannot_be_assigned(self):
         self.assertEqual(call("POST", "/tankers/tnk-02/status", {"status": "OFF_DUTY"}, self.d1)[0], 403)
@@ -234,6 +234,89 @@ class Api(unittest.TestCase):
         self.assertEqual(call("POST", f"/hydrants/{hyd['id']}/delete", {}, self.officer)[0], 200)
         self.assertFalse(any(h["id"] == hyd["id"] for h in call("GET", "/fillpoints")[1]))
         self.assertEqual(call("POST", "/hydrants", {"name": "x", "lat": 1, "lon": 1}, self.disp)[0], 403)
+
+    def test_unsafe_water_blocks_the_trip_until_retested(self):
+        top = call("GET", "/queue")[1][0]
+        rid = top["requestId"]
+        call("POST", f"/requests/{rid}/assign", {"tankerId": "tnk-01", "eta": "18:00"}, self.disp)
+        self.assertTrue(call("GET", f"/requests?colonyId={top['colonyId']}")[1][0].get("promisedAt"))
+        status, fill = call("POST", "/fills", {"litres": 10000, "chlorineMgL": 0.1}, self.d1)
+        self.assertEqual((status, fill["chlorineStatus"]), (201, "unsafe"))
+        status, body = call("POST", f"/requests/{rid}/dispatch", {}, self.d1)
+        self.assertEqual(status, 409)
+        self.assertIn("re-test", body["error"])
+        self.assertEqual(call("POST", f"/fills/{fill['fillId']}/retest", {"chlorineMgL": 0.5}, self.d2)[0], 403)  # other tanker
+        status, retested = call("POST", f"/fills/{fill['fillId']}/retest", {"chlorineMgL": 0.5}, self.d1)
+        self.assertEqual((status, retested["chlorineStatus"], retested["previousChlorineMgL"]), (200, "ok", 0.1))
+        self.assertEqual(call("POST", f"/requests/{rid}/dispatch", {}, self.d1)[0], 200)
+
+    def test_dispatcher_override_for_unsafe_water_needs_reason(self):
+        top = call("GET", "/queue")[1][0]
+        rid = top["requestId"]
+        call("POST", f"/requests/{rid}/assign", {"tankerId": "tnk-01", "eta": "18:00"}, self.disp)
+        call("POST", "/fills", {"litres": 10000, "chlorineMgL": 0.1}, self.d1)
+        self.assertEqual(call("POST", f"/requests/{rid}/dispatch", {}, self.disp)[0], 400)
+        status, req = call("POST", f"/requests/{rid}/dispatch", {"qualityOverride": "Lab test at hydrant passed; kit faulty"}, self.disp)
+        self.assertEqual((status, req["status"]), (200, "ON_THE_WAY"))
+        self.assertIn("quality_override", [h["action"] for h in req["history"]])
+        items = call("GET", "/review", token=self.officer)[1]["items"]
+        self.assertTrue(any(i["type"] == "unsafe_water" for i in items))
+
+    def test_scorecards_schedule_and_dirty_water_link(self):
+        cards = {c["tankerId"]: c for c in call("GET", "/stats")[1]["tankers"]}
+        self.assertEqual(set(cards), {"tnk-01", "tnk-02", "tnk-03"})
+        self.assertIsNotNone(cards["tnk-01"]["onTimePct"])
+        self.assertGreaterEqual(cards["tnk-03"]["noShows"], 1)          # demo: tnk-03 never came to Indira Colony
+        self.assertGreaterEqual(cards["tnk-02"]["quality"]["unsafe"], 1)  # demo: a 0.1 mg/L reading
+        status, sched = call("GET", "/schedule")
+        self.assertEqual(status, 200)
+        queue = call("GET", "/queue")[1]
+        self.assertEqual([s["requestId"] for s in sched], [r["requestId"] for r in queue])  # every waiting colony gets an estimate
+        self.assertTrue(any(not s["tankerFreeNow"] for s in sched))      # 5 colonies, 3 tankers: repeat trips
+        arrivals = [s["arriveAt"] for s in sched]
+        self.assertTrue(all(a for a in arrivals))
+        # a dirty-water complaint is linked to the tanker that delivered last
+        top = queue[0]
+        call("POST", f"/requests/{top['requestId']}/assign", {"tankerId": "tnk-02", "eta": "18:00"}, self.disp)
+        call("POST", f"/requests/{top['requestId']}/deliver", {"litresDelivered": 9000}, self.d2)
+        status, c = call("POST", "/complaints", {"type": "dirty_water", "text": "Water was yellow and smelled of mud"}, self.rep(top["colonyId"]))
+        self.assertEqual(status, 201)
+        items = call("GET", "/review", token=self.officer)[1]["items"]
+        hit = next(i for i in items if i["type"] == "dirty_water_report" and i["complaintId"] == c["complaintId"])
+        self.assertEqual(hit["tankerId"], "tnk-02")
+
+    def test_function_can_serve_the_web_app(self):
+        """WebsiteHosting=api: the same Lambda serves the site, so everything runs on AWS over HTTPS."""
+        import importlib
+        import sys
+        sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "backend"))
+        app = importlib.import_module("app")
+        frontend = os.path.join(os.path.dirname(__file__), "..", "frontend")
+        if not os.path.isdir(frontend):
+            self.skipTest("frontend not mounted")
+        get = lambda path: app.handler({"requestContext": {"http": {"method": "GET"}}, "rawPath": path}, None)  # noqa: E731
+        old = (os.environ.get("SITE_FROM_API"), app.STATIC_DIR)
+        try:
+            os.environ["SITE_FROM_API"], app.STATIC_DIR = "true", frontend
+            home = get("/")
+            self.assertEqual(home["statusCode"], 200)
+            self.assertIn("text/html", home["headers"]["content-type"])
+            self.assertIn("JalSetu", home["body"])
+            js = get("/app.js")
+            self.assertIn("javascript", js["headers"]["content-type"])
+            self.assertEqual(js["headers"]["cache-control"], "no-cache")
+            self.assertEqual(get("/queue")["statusCode"], 200)             # API routes still work
+            self.assertIn("application/json", get("/queue")["headers"]["content-type"])
+            self.assertEqual(get("/../backend/app.py")["statusCode"], 404)  # only the listed app files are served
+            self.assertEqual(get("/seed.py")["statusCode"], 404)
+            os.environ["SITE_FROM_API"] = "false"
+            self.assertEqual(get("/")["statusCode"], 404)                   # off unless WebsiteHosting=api
+        finally:
+            if old[0] is None:
+                os.environ.pop("SITE_FROM_API", None)
+            else:
+                os.environ["SITE_FROM_API"] = old[0]
+            app.STATIC_DIR = old[1]
 
     def test_public_stats_and_open_data(self):
         status, s = call("GET", "/stats")

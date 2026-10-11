@@ -10,3 +10,4 @@ node_modules/
 Thumbs.db
 packaged.yaml
 seed-out.json
+backend/static/

@@ -72,6 +72,11 @@ def review_queue(requests, fills, now=None, complaints=()):
                           "type": "waiting_too_long", "severity": 2,
                           "detail": f"waiting {int(hours_since(r['createdAt'], now))} h for a tanker"})
     for c in complaints:
+        if c.get("status") == "OPEN" and c.get("type") == "dirty_water" and _recent(c.get("createdAt"), 30, now):
+            items.append({"complaintId": c["complaintId"], "colonyId": c.get("colonyId"), "tankerId": c.get("tankerId"),
+                          "requestId": c.get("requestId"), "at": c["createdAt"], "type": "dirty_water_report", "severity": 3,
+                          "detail": f"{c['complaintId']}: dirty water reported"
+                                    + (f" after a delivery by {c['tankerId']}" if c.get("tankerId") else "")})
         if c.get("status") == "OPEN" and hours_since(c["createdAt"], now) > ESCALATE_COMPLAINT_HOURS:
             items.append({"complaintId": c["complaintId"], "colonyId": c.get("colonyId"), "at": c["createdAt"],
                           "type": "complaint_overdue", "severity": 2,
@@ -111,6 +116,15 @@ def review_queue(requests, fills, now=None, complaints=()):
         elif linked and linked.get("fillId") != f["fillId"]:
             items.append({**base, "colonyId": linked["colonyId"], "type": "fill_not_delivered", "severity": 3,
                           "detail": f"{f['litres']} L filled for a trip that was cancelled"})
+        status = f.get("chlorineStatus")
+        if status == "unsafe":
+            items.append({**base, "type": "unsafe_water", "severity": 3,
+                          "detail": f"chlorine {f.get('chlorineMgL')} mg/L at the fill (safe range 0.2-5 mg/L)"})
+        elif status == "high":
+            items.append({**base, "type": "high_chlorine", "severity": 1,
+                          "detail": f"chlorine {f.get('chlorineMgL')} mg/L: safe but strong; check dosing"})
+        elif status == "untested":
+            items.append({**base, "type": "no_quality_test", "severity": 2, "detail": "no chlorine test logged at the fill"})
         if f.get("farFromFillPoint"):
             items.append({**base, "type": "fill_far", "severity": 2,
                           "detail": f"fill logged {f.get('fillPointDistanceM')} m from the nearest fill point"})
@@ -120,7 +134,7 @@ def review_queue(requests, fills, now=None, complaints=()):
     for key, label in (("tankerId", "tanker"), ("colonyId", "colony")):
         counts = {}
         for it in items:
-            if it.get(key) and it["type"] not in ("auto_closed", "waiting_too_long", "complaint_overdue")                     and _recent(it["at"], PATTERN_DAYS, now):
+            if it.get(key) and it["type"] not in ("auto_closed", "waiting_too_long", "complaint_overdue", "high_chlorine")                     and _recent(it["at"], PATTERN_DAYS, now):
                 counts[it[key]] = counts.get(it[key], 0) + 1
         for who, n in counts.items():
             if n >= PATTERN_MIN:

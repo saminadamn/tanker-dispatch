@@ -124,7 +124,7 @@ def travel_minutes(km):
     return int(math.ceil(minutes / 5) * 5)
 
 
-def plan_dispatch(queue, tankers, colonies):
+def plan_dispatch(queue, tankers, colonies, hydrants=None):
     """Give every free tanker a colony, strictly in queue order; each colony gets the nearest free tanker left.
     Never skips the queue, so no override reason is needed."""
     free = [t for t in tankers if t.get("status") == "AVAILABLE"]
@@ -145,5 +145,188 @@ def plan_dispatch(queue, tankers, colonies):
         plan.append({"requestId": r["requestId"], "colonyId": r["colonyId"], "colonyName": r.get("colonyName"),
                      "colonyNameHi": r.get("colonyNameHi"), "tankerId": best["tankerId"],
                      "driverName": best.get("driverName", ""), "km": round(d, 1) if d is not None else None,
-                     "travelMinutes": travel_minutes(d) if d is not None else 45})
+                     "travelMinutes": trip_minutes(best, c, hydrants) if d is not None else 45})
     return plan
+
+
+def trip_minutes(tanker, colony, hydrants):
+    """Minutes until a free tanker arrives full: via the nearest hydrant when hydrants are set up."""
+    if hydrants:
+        minutes, _ = next_trip_minutes(tanker.get("lastLat"), tanker.get("lastLon"), colony, hydrants)
+        return int(math.ceil(minutes / 5) * 5)
+    d = _dist_km(tanker.get("lastLat"), tanker.get("lastLon"), colony.get("lat"), colony.get("lon"))
+    return travel_minutes(d) if d is not None else 45
+
+
+# ---------- Promised arrival times and punctuality ----------
+
+# Arrival times are typed in the ward's local time (India: UTC+5:30).
+LOCAL_OFFSET = timedelta(minutes=int(os.environ.get("WARD_UTC_OFFSET_MINUTES", "330")))
+ON_TIME_GRACE_MIN = 15
+
+
+def promised_at(eta, assigned_iso):
+    """The promised arrival (UTC ISO) for an "HH:MM" local time given when the tanker was assigned.
+    A time earlier than the assignment (by more than 30 minutes) means tomorrow. None if eta isn't HH:MM."""
+    try:
+        hh, mm = (int(x) for x in eta.strip().split(":"))
+        if not (0 <= hh < 24 and 0 <= mm < 60):
+            return None
+    except (ValueError, AttributeError):
+        return None
+    assigned_local = ranking.parse_time(assigned_iso) + LOCAL_OFFSET
+    promised_local = assigned_local.replace(hour=hh, minute=mm, second=0, microsecond=0)
+    if promised_local < assigned_local - timedelta(minutes=30):
+        promised_local += timedelta(days=1)
+    return (promised_local - LOCAL_OFFSET).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _minutes_between(a_iso, b_iso):
+    return (ranking.parse_time(b_iso) - ranking.parse_time(a_iso)).total_seconds() / 60
+
+
+def punctuality(requests, days=30, now=None):
+    """Per tanker, last `days` days: trips with a promised time, how many arrived on time (15 min grace),
+    average lateness of the late ones, and no-shows (trips taken back because the tanker never came)."""
+    now = now or datetime.now(timezone.utc)
+    cutoff = now - timedelta(days=days)
+    recent = lambda iso: bool(iso) and ranking.parse_time(iso) >= cutoff  # noqa: E731
+    per = {}
+
+    def entry(tid):
+        return per.setdefault(tid, {"trips": 0, "onTime": 0, "lateMinutes": [], "noShows": 0})
+
+    for r in requests:
+        tid = r.get("deliveredTankerId") or r.get("tankerId")
+        if r.get("status") == "DELIVERED" and tid and r.get("promisedAt") and recent(r.get("deliveredAt")):
+            e = entry(tid)
+            delay = _minutes_between(r["promisedAt"], r["deliveredAt"])
+            e["trips"] += 1
+            if delay <= ON_TIME_GRACE_MIN:
+                e["onTime"] += 1
+            else:
+                e["lateMinutes"].append(delay)
+        if r.get("missedTankerId") and recent(r.get("requeuedAt")):
+            entry(r["missedTankerId"])["noShows"] += 1
+    out = {}
+    for tid, e in per.items():
+        late = e.pop("lateMinutes")
+        out[tid] = {**e, "onTimePct": round(100 * e["onTime"] / e["trips"]) if e["trips"] else None,
+                    "avgLateMin": round(sum(late) / len(late)) if late else 0}
+    return out
+
+
+# ---------- Water quality: free residual chlorine tested by the driver at the fill ----------
+
+# BIS IS 10500 (Indian drinking water standard): residual free chlorine at least 0.2 mg/L.
+# WHO guideline maximum is 5 mg/L; above 1 mg/L the water is safe but tastes strongly, so dosing should be checked.
+CHLORINE_MIN = 0.2
+CHLORINE_HIGH = 1.0
+CHLORINE_MAX = 5.0
+
+
+def chlorine_status(mg_l):
+    if mg_l is None:
+        return "untested"
+    if mg_l < CHLORINE_MIN or mg_l > CHLORINE_MAX:
+        return "unsafe"
+    return "high" if mg_l > CHLORINE_HIGH else "ok"
+
+
+def quality_summary(fills, days=30, now=None):
+    """Per tanker, last `days` days: chlorine tests logged at fills, how many were safe, untested fills, last reading."""
+    now = now or datetime.now(timezone.utc)
+    cutoff = now - timedelta(days=days)
+    per = {}
+    for f in sorted(fills, key=lambda f: f.get("at") or ""):
+        if not f.get("at") or ranking.parse_time(f["at"]) < cutoff:
+            continue
+        e = per.setdefault(f["tankerId"], {"fills": 0, "tested": 0, "safe": 0, "unsafe": 0,
+                                           "lastChlorine": None, "lastTestAt": None})
+        e["fills"] += 1
+        status = chlorine_status(f.get("chlorineMgL"))
+        if status != "untested":
+            e["tested"] += 1
+            e["lastChlorine"], e["lastTestAt"] = f["chlorineMgL"], f.get("retestedAt") or f["at"]
+            if status == "unsafe":
+                e["unsafe"] += 1
+            else:
+                e["safe"] += 1
+    for e in per.values():
+        e["safePct"] = round(100 * e["safe"] / e["tested"]) if e["tested"] else None
+    return per
+
+
+def tanker_scorecards(tankers, requests, fills, now=None):
+    punct, quality = punctuality(requests, now=now), quality_summary(fills, now=now)
+    empty_q = {"fills": 0, "tested": 0, "safe": 0, "unsafe": 0, "lastChlorine": None, "lastTestAt": None, "safePct": None}
+    return [{"tankerId": t["tankerId"], "driverName": t.get("driverName", ""), "status": t.get("status"),
+             **(punct.get(t["tankerId"]) or {"trips": 0, "onTime": 0, "onTimePct": None, "avgLateMin": 0, "noShows": 0}),
+             "quality": quality.get(t["tankerId"]) or empty_q}
+            for t in tankers]
+
+
+# ---------- Expected arrival for every waiting colony, including tankers' repeat trips ----------
+
+UNLOAD_MIN = 20   # emptying 10,000 L at a colony
+FILL_MIN = 20     # queue + filling at the hydrant
+
+
+def drive_minutes(km):
+    return km / CITY_SPEED_KMH * 60
+
+
+def _dist_km(lat1, lon1, lat2, lon2):
+    if None in (lat1, lon1, lat2, lon2):
+        return None
+    return review.distance_m(lat1, lon1, lat2, lon2) / 1000
+
+
+def next_trip_minutes(lat, lon, colony, hydrants):
+    """Minutes from a tanker's position to arriving full at the colony: to the nearest hydrant, fill, then drive."""
+    if hydrants and lat is not None:
+        hyd, dist_m = review.nearest(hydrants, lat, lon)
+        if hyd:
+            to_colony = _dist_km(hyd["lat"], hyd["lon"], colony.get("lat"), colony.get("lon"))
+            if to_colony is not None:
+                return drive_minutes(dist_m / 1000) + FILL_MIN + drive_minutes(to_colony), hyd["name"]
+    direct = _dist_km(lat, lon, colony.get("lat"), colony.get("lon"))
+    return (drive_minutes(direct) + TRIP_OVERHEAD_MIN if direct is not None else 45), None
+
+
+def schedule(queue, tankers, active, colonies, hydrants, now=None):
+    """Simulate the day forward, strictly in queue order: each waiting colony gets the tanker that can reach it
+    earliest, counting busy tankers from when they finish their current trip (plus unloading), and every trip's
+    drive to a hydrant and fill. Gives a realistic expected arrival for every colony in the queue."""
+    now = now or datetime.now(timezone.utc)
+    trip_of = {r["tankerId"]: r for r in active if r.get("tankerId")}
+    state = {}
+    for t in tankers:
+        if t.get("status") == "OFF_DUTY":
+            continue
+        if t.get("status") == "AVAILABLE":
+            state[t["tankerId"]] = (now, t.get("lastLat"), t.get("lastLon"), t)
+            continue
+        r = trip_of.get(t["tankerId"])
+        c = colonies.get(r["colonyId"], {}) if r else {}
+        due = ranking.parse_time(r["promisedAt"]) if r and r.get("promisedAt") else now + timedelta(minutes=30)
+        state[t["tankerId"]] = (max(now, due) + timedelta(minutes=UNLOAD_MIN),
+                                c.get("lat", t.get("lastLat")), c.get("lon", t.get("lastLon")), t)
+    out = []
+    for r in queue:
+        if not state:
+            break
+        colony = colonies.get(r["colonyId"], {})
+        best = None
+        for tid, (free_at, lat, lon, t) in state.items():
+            minutes, via = next_trip_minutes(lat, lon, colony, hydrants)
+            arrive = free_at + timedelta(minutes=minutes)
+            if best is None or arrive < best[0]:
+                best = (arrive, tid, free_at, via, t)
+        arrive, tid, free_at, via, t = best
+        out.append({"requestId": r["requestId"], "colonyId": r["colonyId"], "tankerId": tid,
+                    "driverName": t.get("driverName", ""), "tankerFreeNow": free_at <= now,
+                    "startsAt": free_at.strftime("%Y-%m-%dT%H:%M:%SZ"), "arriveAt": arrive.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    "viaHydrant": via})
+        state[tid] = (arrive + timedelta(minutes=UNLOAD_MIN), colony.get("lat"), colony.get("lon"), t)
+    return out

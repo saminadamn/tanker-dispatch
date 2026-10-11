@@ -17,7 +17,7 @@ import store
 OPEN_STATUSES = ("PENDING", "ASSIGNED", "ON_THE_WAY")
 TANKER_OUT = ("ASSIGNED", "ON_THE_WAY")
 ACTION_PATH = re.compile(r"^/requests/([^/]+)/(assign|dispatch|confirm|deliver|release|photo|resolve|cancel)$")
-ITEM_PATH = re.compile(r"^/(fills|users|tankers|colonies|complaints|hydrants)/([^/]+)/(review|disable|status|settings|resolve|delete)$")
+ITEM_PATH = re.compile(r"^/(fills|users|tankers|colonies|complaints|hydrants)/([^/]+)/(review|disable|status|settings|resolve|delete|retest)$")
 AUTO_RELEASE_HOURS = float(os.environ.get("AUTO_RELEASE_HOURS", "4"))
 # Driver and colony readings further apart than this are publicly marked "disputed".
 DISPUTE_TOLERANCE = 0.10
@@ -407,19 +407,35 @@ def assign(request_id, body, user):
         detail += f", {dist[0]} km away"
     if fill_points_list():
         extra["fillRequired"] = True
+    promised = insights.promised_at(eta.strip(), now_iso())
+    if promised:
+        extra["promisedAt"] = promised
     store.assign(request_id, tanker_id, eta.strip(), now_iso(), history_event(user, "assigned", detail), extra)
     notify_assigned(req, tanker, eta.strip())
     return 200, store.get_request(request_id)
 
 
-def dispatch(request_id, user):
+def dispatch(request_id, body, user):
     require_role(user, "dispatcher", "driver")
     req = require_request(request_id)
     if user["role"] == "driver" and user.get("tankerId") != req.get("tankerId"):
         raise ApiError(403, "This trip belongs to another tanker")
     if req["status"] != "ASSIGNED":
         raise ApiError(409, "Only an ASSIGNED request can be marked on the way")
-    store.dispatch(request_id, now_iso(), history_event(user, "on_the_way"))
+    detail = ""
+    if req.get("waterSafe") is False:
+        reading = f"{req.get('chlorineMgL')} mg/L"
+        if user["role"] != "dispatcher":
+            raise ApiError(409, f"The chlorine test ({reading}) is outside the safe range "
+                                f"{insights.CHLORINE_MIN}-{insights.CHLORINE_MAX} mg/L. Re-chlorinate or refill, then re-test")
+        reason = (body.get("qualityOverride") or "").strip()
+        if len(reason) < MIN_OVERRIDE_REASON:
+            raise ApiError(400, f"Chlorine {reading} is unsafe. Sending it anyway needs a written reason "
+                                f"(at least {MIN_OVERRIDE_REASON} characters), shown publicly")
+        store.update_request(request_id, {"qualityOverride": {"reason": reason[:300], "by": user.get("name", ""), "at": now_iso()}},
+                             history_event(user, "quality_override", reason[:300]))
+        detail = "despite failed chlorine test"
+    store.dispatch(request_id, now_iso(), history_event(user, "on_the_way", detail))
     return 200, store.get_request(request_id)
 
 
@@ -602,7 +618,14 @@ def log_fill(body, user):
     trip = next((r for r in store.list_requests() if r.get("tankerId") == tanker_id and r["status"] in TANKER_OUT), None)
     fill = {"fillId": f"F-{uuid.uuid4().hex[:10]}", "tankerId": tanker_id, "litres": litres, "at": now_iso(),
             "by": user.get("name", ""), "ref": auth.mask_phone(user["phone"])}
-    detail = f"{litres} L"
+    chlorine = parse_chlorine(body)
+    status = insights.chlorine_status(chlorine)
+    fill["chlorineStatus"] = status
+    if chlorine is not None:
+        fill["chlorineMgL"] = chlorine
+    trip_fields = {"chlorineMgL": chlorine, "chlorineStatus": status, "waterSafe": status != "unsafe"} \
+        if chlorine is not None else {"chlorineStatus": "untested"}
+    detail = f"{litres} L" + (f", chlorine {chlorine} mg/L ({status})" if chlorine is not None else ", no chlorine test")
     if location:
         fill["location"] = location
         point, dist = review.nearest(fill_points_list(), location["lat"], location["lon"])
@@ -615,10 +638,53 @@ def log_fill(body, user):
         detail += ", no GPS"
     if trip:
         fill["requestId"] = trip["requestId"]
-        store.add_fill(fill, trip["requestId"], history_event(user, "filled", detail))
+        store.add_fill(fill, trip["requestId"], history_event(user, "filled", detail), trip_fields)
     else:
         store.add_fill(fill)
     return 201, fill
+
+
+def parse_chlorine(body):
+    """Free residual chlorine in mg/L from the driver's test kit, or None if not tested."""
+    value = body.get("chlorineMgL")
+    if value in (None, ""):
+        return None
+    try:
+        value = round(float(value), 2)
+    except (TypeError, ValueError):
+        raise ApiError(400, "chlorineMgL must be a number (mg/L)")
+    if not 0 <= value <= 20:
+        raise ApiError(400, "chlorineMgL must be between 0 and 20 mg/L")
+    return value
+
+
+def retest(fill_id, body, user):
+    """Driver re-tests chlorine after re-chlorinating or refilling."""
+    require_role(user, "driver")
+    fill = store.get_fill(fill_id)
+    if not fill:
+        raise ApiError(404, "Fill not found")
+    if fill["tankerId"] != user.get("tankerId"):
+        raise ApiError(403, "Not your tanker's fill")
+    chlorine = parse_chlorine(body)
+    if chlorine is None:
+        raise ApiError(400, "chlorineMgL is required")
+    status = insights.chlorine_status(chlorine)
+    trip = store.get_request(fill["requestId"]) if fill.get("requestId") else None
+    linked = trip if trip and trip.get("status") == "ASSIGNED" and trip.get("fillId") == fill_id else None
+    store.retest_fill(fill_id, {"chlorineMgL": chlorine, "chlorineStatus": status, "retestedAt": now_iso(),
+                                "previousChlorineMgL": fill.get("chlorineMgL")},
+                      linked["requestId"] if linked else None,
+                      {"chlorineMgL": chlorine, "chlorineStatus": status, "waterSafe": status != "unsafe"},
+                      history_event(user, "retested", f"chlorine {chlorine} mg/L ({status})"))
+    return 200, store.get_fill(fill_id)
+
+
+def expected_schedule():
+    """Expected arrival for every waiting colony, counting tankers' current trips, refills and repeat trips."""
+    reqs = store.list_requests()
+    active = [r for r in reqs if r["status"] in TANKER_OUT]
+    return 200, insights.schedule(queue()[1], store.list_tankers(), active, colonies_by_id(), fill_points_list())
 
 
 def upload_photo(request_id, body, user):
@@ -777,7 +843,7 @@ def colony_settings(colony_id, body, user):
 def plan(user):
     """Suggested assignment for every free tanker, in queue order, nearest tanker first."""
     require_role(user, "dispatcher")
-    return 200, insights.plan_dispatch(queue()[1], store.list_tankers(), colonies_by_id())
+    return 200, insights.plan_dispatch(queue()[1], store.list_tankers(), colonies_by_id(), fill_points_list())
 
 
 def parse_point(body):
@@ -893,6 +959,14 @@ def file_complaint(body, user):
         item["colonyId"] = colony_id
     if body.get("requestId"):
         item["requestId"] = str(body["requestId"])[:64]
+    if kind in ("dirty_water", "short_water") and colony_id and "requestId" not in item:
+        # Link to the colony's latest delivery in the last 3 days, so it counts against that tanker.
+        recent = [r for r in store.list_requests() if r["colonyId"] == colony_id and r["status"] == "DELIVERED"
+                  and r.get("deliveredAt") and datetime.now(timezone.utc) - ranking.parse_time(r["deliveredAt"]) <= timedelta(days=3)]
+        if recent:
+            last = max(recent, key=lambda r: r["deliveredAt"])
+            item["requestId"] = last["requestId"]
+            item["tankerId"] = last.get("deliveredTankerId") or last.get("tankerId")
     store.put_complaint(item)
     return 201, public_complaint(item, user)
 
@@ -930,8 +1004,10 @@ def resolve_complaint(complaint_id, body, user):
 
 def stats():
     reqs = store.list_requests()
+    fills = store.list_fills()
     return 200, {**review.stats(reqs, colonies_by_id(), store.list_complaints()),
-                 "impact": insights.impact(reqs, store.list_fills())}
+                 "impact": insights.impact(reqs, fills),
+                 "tankers": insights.tanker_scorecards(store.list_tankers(), reqs, fills)}
 
 
 def overrides():
@@ -993,6 +1069,8 @@ def route(method, path, body, query, headers):
         return export_csv()
     if method == "GET" and path == "/fillpoints":
         return fill_points()
+    if method == "GET" and path == "/schedule":
+        return expected_schedule()
     if method == "GET" and path == "/dispatch/plan":
         return plan(user())
     if method == "POST" and path == "/colonies":
@@ -1015,7 +1093,7 @@ def route(method, path, body, query, headers):
         item_handlers = {("fills", "review"): review_fill, ("users", "disable"): disable_user,
                          ("tankers", "status"): set_tanker_status, ("colonies", "settings"): colony_settings,
                          ("complaints", "resolve"): resolve_complaint, ("tankers", "settings"): tanker_settings,
-                         ("hydrants", "delete"): delete_hydrant}
+                         ("hydrants", "delete"): delete_hydrant, ("fills", "retest"): retest}
         if (kind, action) in item_handlers:
             return item_handlers[(kind, action)](key, body, user())
     if path == "/requests":
@@ -1031,9 +1109,37 @@ def route(method, path, body, query, headers):
         handlers = {"assign": assign, "confirm": confirm, "deliver": deliver, "release": release,
                     "photo": upload_photo, "resolve": resolve_request, "cancel": cancel}
         if action == "dispatch":
-            return dispatch(request_id, user())
+            return dispatch(request_id, body, user())
         return handlers[action](request_id, body, user())
     raise ApiError(404, f"No route for {method} {path}")
+
+
+# ---------- web app served by this function (WebsiteHosting=api: everything on AWS, HTTPS via API Gateway) ----------
+
+STATIC_DIR = os.environ.get("STATIC_DIR") or os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
+STATIC_FILES = {  # name -> (content type, cache seconds); the app files change on every deploy, so no long caching
+    "index.html": ("text/html; charset=utf-8", 0), "app.js": ("text/javascript; charset=utf-8", 0),
+    "styles.css": ("text/css; charset=utf-8", 0), "config.js": ("text/javascript; charset=utf-8", 0),
+    "sw.js": ("text/javascript; charset=utf-8", 0), "manifest.webmanifest": ("application/manifest+json", 3600),
+    "icon.svg": ("image/svg+xml", 86400),
+}
+
+
+def static_file(path):
+    name = "index.html" if path == "/" else path.lstrip("/")
+    if name not in STATIC_FILES:
+        return None
+    try:
+        with open(os.path.join(STATIC_DIR, name), encoding="utf-8") as f:
+            body = f.read()
+    except OSError:
+        return None
+    content_type, max_age = STATIC_FILES[name]
+    return {"statusCode": 200, "body": body, "headers": {
+        "content-type": content_type,
+        "cache-control": f"public, max-age={max_age}" if max_age else "no-cache",
+        "x-content-type-options": "nosniff",
+    }}
 
 
 def handler(event, context):
@@ -1053,6 +1159,10 @@ def handler(event, context):
     headers = {k.lower(): v for k, v in (event.get("headers") or {}).items()}
     if method == "OPTIONS":
         return response(204, None)
+    if method == "GET" and os.environ.get("SITE_FROM_API") == "true":
+        page = static_file(path)
+        if page:
+            return page
     try:
         status, body = route(method, path, parse_body(event), event.get("queryStringParameters") or {}, headers)
         return response(status, body)
