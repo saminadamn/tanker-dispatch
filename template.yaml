@@ -1,0 +1,317 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: Water Tanker Fair Dispatch Board (API Gateway + Lambda + DynamoDB + S3 website)
+
+Parameters:
+  SmsEnabled:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+    Description: Send an SMS (via SNS) to the colony rep when a tanker is assigned. SMS is NOT free tier.
+  WardName:
+    Type: String
+    Default: Delhi
+  WardLatitude:
+    Type: String
+    Default: "28.61"
+  WardLongitude:
+    Type: String
+    Default: "77.21"
+  HeatThresholdC:
+    Type: String
+    Default: "40"
+    Description: Max temperature (C) that triggers the heatwave warning (IMD plains heatwave = 40).
+  AuthSecretName:
+    Type: String
+    Default: tanker-dispatch/auth-secret
+    Description: SSM SecureString (name without the leading /) holding the token signing secret. deploy.ps1 creates it once.
+  AutoReleaseHours:
+    Type: String
+    Default: "4"
+    Description: Hours after which an unconfirmed tanker is released automatically (checked every 15 minutes).
+  FillPoints:
+    Type: String
+    Default: '[{"id":"fp-1","name":"Rajghat hydrant","lat":28.6400,"lon":77.2490},{"id":"fp-2","name":"ITO filling station","lat":28.6290,"lon":77.2410},{"id":"fp-3","name":"Jhandewalan booster","lat":28.6440,"lon":77.2000}]'
+    Description: JSON list of the ward's hydrants / filling stations (id, name, lat, lon). Fills logged far from all of them are flagged.
+  AlertEmail:
+    Type: String
+    Default: ""
+    Description: Email for error alarms (you must click the confirmation link AWS sends). Leave empty for no alarms.
+
+Conditions:
+  HasAlertEmail: !Not [!Equals [!Ref AlertEmail, ""]]
+
+Globals:
+  Function:
+    Runtime: python3.12
+    Timeout: 15
+    MemorySize: 256
+
+Resources:
+  ColoniesTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PROVISIONED
+      ProvisionedThroughput: { ReadCapacityUnits: 4, WriteCapacityUnits: 4 }
+      AttributeDefinitions:
+        - { AttributeName: colonyId, AttributeType: S }
+      KeySchema:
+        - { AttributeName: colonyId, KeyType: HASH }
+
+  TankersTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PROVISIONED
+      ProvisionedThroughput: { ReadCapacityUnits: 4, WriteCapacityUnits: 4 }
+      AttributeDefinitions:
+        - { AttributeName: tankerId, AttributeType: S }
+      KeySchema:
+        - { AttributeName: tankerId, KeyType: HASH }
+
+  RequestsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PROVISIONED
+      ProvisionedThroughput: { ReadCapacityUnits: 4, WriteCapacityUnits: 4 }
+      AttributeDefinitions:
+        - { AttributeName: requestId, AttributeType: S }
+      KeySchema:
+        - { AttributeName: requestId, KeyType: HASH }
+
+  # Sign-in accounts (phone + hashed PIN). 6 tables x 4 units = 24, inside the always-free 25.
+  UsersTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PROVISIONED
+      ProvisionedThroughput: { ReadCapacityUnits: 4, WriteCapacityUnits: 4 }
+      AttributeDefinitions:
+        - { AttributeName: phone, AttributeType: S }
+      KeySchema:
+        - { AttributeName: phone, KeyType: HASH }
+
+  # Water filled at hydrants, checked against what each trip delivered.
+  FillsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PROVISIONED
+      ProvisionedThroughput: { ReadCapacityUnits: 4, WriteCapacityUnits: 4 }
+      AttributeDefinitions:
+        - { AttributeName: fillId, AttributeType: S }
+      KeySchema:
+        - { AttributeName: fillId, KeyType: HASH }
+
+  ComplaintsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PROVISIONED
+      ProvisionedThroughput: { ReadCapacityUnits: 4, WriteCapacityUnits: 4 }
+      AttributeDefinitions:
+        - { AttributeName: complaintId, AttributeType: S }
+      KeySchema:
+        - { AttributeName: complaintId, KeyType: HASH }
+
+  # Delivery photos: private, encrypted, read only through the API by the officer, dispatcher,
+  # the driver and that colony's rep. Deleted after a year.
+  PhotoBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        IgnorePublicAcls: true
+        BlockPublicPolicy: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: { SSEAlgorithm: AES256 }
+      LifecycleConfiguration:
+        Rules:
+          - Id: delete-old-photos
+            Status: Enabled
+            ExpirationInDays: 365
+
+  HttpApi:
+    Type: AWS::Serverless::HttpApi
+    Properties:
+      # Caps the whole API (free); stops a runaway script from running up Lambda/DynamoDB usage.
+      DefaultRouteSettings:
+        ThrottlingBurstLimit: 50
+        ThrottlingRateLimit: 20
+      CorsConfiguration:
+        AllowOrigins: ["*"]
+        AllowMethods: [GET, POST, OPTIONS]
+        AllowHeaders: [content-type, authorization]
+        MaxAge: 600
+
+  ApiFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: backend/
+      Handler: app.handler
+      Environment:
+        Variables:
+          COLONIES_TABLE: !Ref ColoniesTable
+          TANKERS_TABLE: !Ref TankersTable
+          REQUESTS_TABLE: !Ref RequestsTable
+          USERS_TABLE: !Ref UsersTable
+          FILLS_TABLE: !Ref FillsTable
+          COMPLAINTS_TABLE: !Ref ComplaintsTable
+          PHOTO_BUCKET: !Ref PhotoBucket
+          FILL_POINTS: !Ref FillPoints
+          AUTH_SECRET_PARAM: !Sub "/${AuthSecretName}"
+          SMS_ENABLED: !Ref SmsEnabled
+          WARD_NAME: !Ref WardName
+          WARD_LAT: !Ref WardLatitude
+          WARD_LON: !Ref WardLongitude
+          HEAT_THRESHOLD_C: !Ref HeatThresholdC
+          AUTO_RELEASE_HOURS: !Ref AutoReleaseHours
+      Policies:
+        - DynamoDBCrudPolicy: { TableName: !Ref ColoniesTable }
+        - DynamoDBCrudPolicy: { TableName: !Ref TankersTable }
+        - DynamoDBCrudPolicy: { TableName: !Ref RequestsTable }
+        - DynamoDBCrudPolicy: { TableName: !Ref UsersTable }
+        - DynamoDBCrudPolicy: { TableName: !Ref FillsTable }
+        - DynamoDBCrudPolicy: { TableName: !Ref ComplaintsTable }
+        - S3CrudPolicy: { BucketName: !Ref PhotoBucket }
+        - SSMParameterReadPolicy: { ParameterName: !Ref AuthSecretName }
+        - Statement:
+            - Effect: Allow
+              Action: sns:Publish
+              Resource: "*"
+      Events:
+        Proxy:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /{proxy+}
+            Method: ANY
+        # Frees tankers whose delivery was never confirmed. EventBridge schedules are free;
+        # ~2,900 Lambda runs a month is far inside the 1M free requests.
+        AutoRelease:
+          Type: Schedule
+          Properties:
+            Schedule: rate(15 minutes)
+            Input: '{"autoRelease": true}'
+
+  WebsiteBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      WebsiteConfiguration:
+        IndexDocument: index.html
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        IgnorePublicAcls: true
+        BlockPublicPolicy: false
+        RestrictPublicBuckets: false
+
+  WebsiteBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref WebsiteBucket
+      PolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal: "*"
+            Action: s3:GetObject
+            Resource: !Sub "${WebsiteBucket.Arn}/*"
+
+  # HTTPS in front of the S3 website (browsers only allow the microphone on HTTPS).
+  # CloudFront always-free tier: 1 TB transfer and 10M requests per month.
+  WebsiteCdn:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        Comment: Tanker dispatch website
+        DefaultRootObject: index.html
+        PriceClass: PriceClass_200
+        HttpVersion: http2
+        Origins:
+          - Id: s3-website
+            DomainName: !Select [2, !Split ["/", !GetAtt WebsiteBucket.WebsiteURL]]
+            CustomOriginConfig:
+              OriginProtocolPolicy: http-only
+        DefaultCacheBehavior:
+          TargetOriginId: s3-website
+          ViewerProtocolPolicy: redirect-to-https
+          CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad  # Managed-CachingDisabled
+          AllowedMethods: [GET, HEAD]
+          Compress: true
+
+  # ---------- Monitoring: email when something breaks (SNS email and 3 alarms are free tier) ----------
+  AlertTopic:
+    Type: AWS::SNS::Topic
+    Condition: HasAlertEmail
+    Properties:
+      Subscription:
+        - Protocol: email
+          Endpoint: !Ref AlertEmail
+
+  ErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: HasAlertEmail
+    Properties:
+      AlarmDescription: The API Lambda raised errors (includes the auto-release job)
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions: [{ Name: FunctionName, Value: !Ref ApiFunction }]
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlertTopic]
+
+  ThrottlesAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: HasAlertEmail
+    Properties:
+      AlarmDescription: The API Lambda is being throttled
+      Namespace: AWS/Lambda
+      MetricName: Throttles
+      Dimensions: [{ Name: FunctionName, Value: !Ref ApiFunction }]
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlertTopic]
+
+  ServerErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: HasAlertEmail
+    Properties:
+      AlarmDescription: The HTTP API returned 5 or more server errors in 5 minutes
+      Namespace: AWS/ApiGateway
+      MetricName: 5xx
+      Dimensions: [{ Name: ApiId, Value: !Ref HttpApi }]
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 5
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlertTopic]
+
+Outputs:
+  ApiUrl:
+    Value: !Sub "https://${HttpApi}.execute-api.${AWS::Region}.amazonaws.com"
+  WebsiteUrl:
+    Description: HTTPS site (use this one, the microphone needs HTTPS)
+    Value: !Sub "https://${WebsiteCdn.DomainName}"
+  S3WebsiteUrl:
+    Value: !GetAtt WebsiteBucket.WebsiteURL
+  WebsiteBucketName:
+    Value: !Ref WebsiteBucket
+  FunctionName:
+    Value: !Ref ApiFunction
+  PhotoBucketName:
+    Description: Private delivery photos (empty it before deleting the stack)
+    Value: !Ref PhotoBucket

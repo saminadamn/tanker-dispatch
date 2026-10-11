@@ -1,0 +1,45 @@
+# Local run: DynamoDB Local + the same Lambda code behind a tiny HTTP adapter + nginx for the page.
+#   docker compose up --build      ->  http://localhost:8080
+services:
+  dynamodb:
+    image: amazon/dynamodb-local:2.5.2
+    command: ["-jar", "DynamoDBLocal.jar", "-inMemory", "-sharedDb"]
+    ports: ["8000:8000"]
+
+  api:
+    image: python:3.12-slim
+    working_dir: /app
+    command: sh -c "pip install --quiet --disable-pip-version-check boto3==1.35.36 && python -u local/server.py"
+    environment:
+      AWS_ACCESS_KEY_ID: local
+      AWS_SECRET_ACCESS_KEY: local
+      AWS_DEFAULT_REGION: ap-south-1
+      AWS_ENDPOINT_URL_DYNAMODB: http://dynamodb:8000
+      COLONIES_TABLE: Colonies
+      TANKERS_TABLE: Tankers
+      REQUESTS_TABLE: Requests
+      USERS_TABLE: Users
+      FILLS_TABLE: Fills
+      COMPLAINTS_TABLE: Complaints
+      PHOTO_DIR: /tmp/photos   # stands in for the private S3 photo bucket
+      AUTH_SECRET: local-dev-secret-not-for-production
+      FILL_POINTS: '[{"id":"fp-1","name":"Rajghat hydrant","lat":28.6400,"lon":77.2490},{"id":"fp-2","name":"ITO filling station","lat":28.6290,"lon":77.2410},{"id":"fp-3","name":"Jhandewalan booster","lat":28.6440,"lon":77.2000}]'
+      SMS_ENABLED: "false"
+      WARD_NAME: Delhi
+      WARD_LAT: "28.61"
+      WARD_LON: "77.21"
+      HEAT_THRESHOLD_C: "40"
+      AUTO_RELEASE_HOURS: "4"
+    volumes:
+      - ./backend:/app/backend:ro
+      - ./local:/app/local:ro
+      - ./tests:/app/tests:ro   # docker compose exec api python -m unittest discover -s tests -v
+    ports: ["3001:3001"]
+    depends_on: [dynamodb]
+
+  web:
+    image: nginx:1.27-alpine
+    volumes:
+      - ./frontend:/usr/share/nginx/html:ro
+      - ./local/config.local.js:/usr/share/nginx/html/config.js:ro
+    ports: ["8080:80"]

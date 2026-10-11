@@ -1,0 +1,13 @@
+{
+  "name": "JalSetu · Fair Water Dispatch",
+  "short_name": "JalSetu",
+  "description": "Fair water tanker dispatch for your ward / निष्पक्ष पानी टैंकर वितरण",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "background_color": "#f3f7fb",
+  "theme_color": "#f3f7fb",
+  "icons": [
+    { "src": "icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any maskable" }
+  ]
+}
