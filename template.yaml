@@ -37,9 +37,15 @@ Parameters:
     Type: String
     Default: ""
     Description: Email for error alarms (you must click the confirmation link AWS sends). Leave empty for no alarms.
+  WebsiteHosting:
+    Type: String
+    Default: cloudfront
+    AllowedValues: [cloudfront, external]
+    Description: cloudfront = S3 website behind CloudFront. external = no website resources here; host frontend/ elsewhere over HTTPS (e.g. GitHub Pages).
 
 Conditions:
   HasAlertEmail: !Not [!Equals [!Ref AlertEmail, ""]]
+  HostsWebsite: !Equals [!Ref WebsiteHosting, cloudfront]
 
 Globals:
   Function:
@@ -197,6 +203,7 @@ Resources:
 
   WebsiteBucket:
     Type: AWS::S3::Bucket
+    Condition: HostsWebsite
     Properties:
       WebsiteConfiguration:
         IndexDocument: index.html
@@ -211,6 +218,7 @@ Resources:
 
   WebsiteBucketPolicy:
     Type: AWS::S3::BucketPolicy
+    Condition: HostsWebsite
     Properties:
       Bucket: !Ref WebsiteBucket
       PolicyDocument:
@@ -224,6 +232,7 @@ Resources:
   # CloudFront always-free tier: 1 TB transfer and 10M requests per month.
   WebsiteCdn:
     Type: AWS::CloudFront::Distribution
+    Condition: HostsWebsite
     Properties:
       DistributionConfig:
         Enabled: true
@@ -304,11 +313,14 @@ Outputs:
   ApiUrl:
     Value: !Sub "https://${HttpApi}.execute-api.${AWS::Region}.amazonaws.com"
   WebsiteUrl:
+    Condition: HostsWebsite
     Description: HTTPS site (use this one, the microphone needs HTTPS)
     Value: !Sub "https://${WebsiteCdn.DomainName}"
   S3WebsiteUrl:
+    Condition: HostsWebsite
     Value: !GetAtt WebsiteBucket.WebsiteURL
   WebsiteBucketName:
+    Condition: HostsWebsite
     Value: !Ref WebsiteBucket
   FunctionName:
     Value: !Ref ApiFunction

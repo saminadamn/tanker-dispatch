@@ -1,2 +1,2 @@
-// Overwritten by deploy.ps1 with the real API Gateway URL.
-window.API_URL = "";
+window.API_URL = "https://92isxc0ldi.execute-api.ap-south-1.amazonaws.com";
+window.DEMO = true;
